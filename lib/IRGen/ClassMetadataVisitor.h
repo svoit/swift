@@ -35,7 +35,7 @@ class IRGenModule;
 template <class Impl> class ClassMetadataVisitor
     : public NominalMetadataVisitor<Impl>,
       public SILVTableVisitor<Impl> {
-  typedef NominalMetadataVisitor<Impl> super;
+  using super = NominalMetadataVisitor<Impl>;
 
 protected:
   using super::IGM;
@@ -45,7 +45,7 @@ protected:
   ClassDecl *const Target;
 
   ClassMetadataVisitor(IRGenModule &IGM, ClassDecl *target)
-    : super(IGM), SILVTableVisitor<Impl>(IGM.getSILTypes()), Target(target) {}
+    : super(IGM), Target(target) {}
 
 public:
   void layout() {
@@ -61,7 +61,7 @@ public:
     // isn't necessary.
     // FIXME: Figure out what can be removed altogether in non-objc-interop
     // mode and remove it. rdar://problem/18801263
-    asImpl().addSuperClass();
+    asImpl().addSuperclass();
     asImpl().addClassCacheData();
     asImpl().addClassDataPointer();
 
@@ -76,7 +76,7 @@ public:
     asImpl().addIVarDestroyer();
 
     // Class members.
-    addClassMembers(Target, Target->getDeclaredTypeInContext());
+    addClassMembers(Target);
   }
 
   /// Notes the beginning of the field offset vector for a particular ancestor
@@ -89,26 +89,39 @@ public:
 
 private:
   /// Add fields associated with the given class and its bases.
-  void addClassMembers(ClassDecl *theClass, Type type) {
-    // Add any fields associated with the superclass.
-    // NB: We don't apply superclass substitutions to members because we want
-    // consistent metadata layout between generic superclasses and concrete
-    // subclasses.
-    if (Type superclass = type->getSuperclass()) {
-      ClassDecl *superclassDecl = superclass->getClassOrBoundGenericClass();
-      // Skip superclass fields if superclass is resilient.
-      // FIXME: Needs runtime support to ensure the field offset vector is
-      // populated correctly.
-      if (!IGM.Context.LangOpts.EnableClassResilience ||
-          !IGM.isResilient(superclassDecl, ResilienceExpansion::Maximal)) {
-        addClassMembers(superclassDecl, superclass);
+  void addClassMembers(ClassDecl *theClass) {
+    // Visit the superclass first.
+    if (auto *superclassDecl = theClass->getSuperclassDecl()) {
+      if (superclassDecl->hasClangNode()) {
+        // Nothing to do; Objective-C classes do not add new members to
+        // Swift class metadata.
+      } else if (IGM.isResilient(superclassDecl, ResilienceExpansion::Maximal)) {
+        // Runtime metadata instantiation will initialize our field offset
+        // vector and vtable entries.
+        //
+        // Metadata access needs to access our fields relative to a
+        // global variable.
+        asImpl().noteResilientSuperclass();
+      } else {
+        // NB: We don't apply superclass substitutions to members because we want
+        // consistent metadata layout between generic superclasses and concrete
+        // subclasses.
+        addClassMembers(superclassDecl);
       }
     }
 
+    // Note that we have to emit a global variable storing the metadata
+    // start offset, or access remaining fields relative to one.
+    asImpl().noteStartOfImmediateMembers(theClass);
+
     // Add space for the generic parameters, if applicable.
-    // Note that we only add references for the immediate parameters;
-    // parameters for the parent context are handled by the parent.
-    asImpl().addGenericFields(theClass, type, theClass);
+    // This must always be the first item in the immediate members.
+    asImpl().addGenericFields(theClass, theClass);
+
+    // If the class is resilient, we cannot make any assumptions about its
+    // member layout at all, so skip the rest of this method.
+    if (IGM.isResilient(theClass, ResilienceExpansion::Maximal))
+      return;
 
     // Add vtable entries.
     asImpl().addVTableEntries(theClass);
@@ -151,7 +164,8 @@ private:
 /// the metadata layout, maintaining the offset of the next field.
 template <class Impl>
 class ClassMetadataScanner : public ClassMetadataVisitor<Impl> {
-  typedef ClassMetadataVisitor<Impl> super;
+  using super = ClassMetadataVisitor<Impl>;
+
 protected:
   Size NextOffset = Size(0);
 
@@ -164,7 +178,7 @@ public:
   void addIVarDestroyer() { addPointer(); }
   void addValueWitnessTable() { addPointer(); }
   void addDestructorFunction() { addPointer(); }
-  void addSuperClass() { addPointer(); }
+  void addSuperclass() { addPointer(); }
   void addClassFlags() { addInt32(); }
   void addInstanceAddressPoint() { addInt32(); }
   void addInstanceSize() { addInt32(); }
@@ -185,13 +199,8 @@ public:
       addPointer();
     }
   }
-  void addGenericArgument(CanType argument, ClassDecl *forClass) {
-    addPointer();
-  }
-  void addGenericWitnessTable(CanType argument, ProtocolConformanceRef conf,
-                              ClassDecl *forClass) {
-    addPointer();
-  }
+  void addGenericArgument(ClassDecl *forClass) { addPointer(); }
+  void addGenericWitnessTable(ClassDecl *forClass) { addPointer(); }
   void addPlaceholder(MissingMemberDecl *MMD) {
     for (auto i : range(MMD->getNumberOfVTableEntries())) {
       (void)i;

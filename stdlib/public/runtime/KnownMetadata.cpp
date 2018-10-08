@@ -67,14 +67,6 @@ const ValueWitnessTable swift::VALUE_WITNESS_SYM(Bi512_) =
 const ExtraInhabitantsValueWitnessTable swift::VALUE_WITNESS_SYM(Bo) =
   ValueWitnessTableForBox<SwiftRetainableBox>::table;
 
-/// The basic value-witness table for Swift unowned pointers.
-const ExtraInhabitantsValueWitnessTable swift::UNOWNED_VALUE_WITNESS_SYM(Bo) =
-  ValueWitnessTableForBox<SwiftUnownedRetainableBox>::table;
-
-/// The basic value-witness table for Swift weak pointers.
-const ValueWitnessTable swift::WEAK_VALUE_WITNESS_SYM(Bo) =
-  ValueWitnessTableForBox<SwiftWeakRetainableBox>::table;
-
 /// The value-witness table for pointer-aligned unmanaged pointer types.
 const ExtraInhabitantsValueWitnessTable swift::METATYPE_VALUE_WITNESS_SYM(Bo) =
   ValueWitnessTableForBox<PointerPointerBox>::table;
@@ -103,19 +95,12 @@ static const ValueWitnessTable VALUE_WITNESS_SYM(BB) =
 const ExtraInhabitantsValueWitnessTable swift::VALUE_WITNESS_SYM(BO) =
   ValueWitnessTableForBox<ObjCRetainableBox>::table;
 
-/// The basic value-witness table for ObjC unowned pointers.
-const ExtraInhabitantsValueWitnessTable swift::UNOWNED_VALUE_WITNESS_SYM(BO) =
-  ValueWitnessTableForBox<ObjCUnownedRetainableBox>::table;
-
-/// The basic value-witness table for ObjC weak pointers.
-const ValueWitnessTable swift::WEAK_VALUE_WITNESS_SYM(BO) =
-  ValueWitnessTableForBox<ObjCWeakRetainableBox>::table;
-
 #endif
 
 /*** Functions ***************************************************************/
 
 namespace {
+  // @escaping function types.
   struct ThickFunctionBox
     : AggregateBox<FunctionPointerBox, SwiftRetainableBox> {
 
@@ -130,12 +115,32 @@ namespace {
       return FunctionPointerBox::getExtraInhabitantIndex((void * const *) src);
     }
   };
+  /// @noescape function types.
+  struct TrivialThickFunctionBox
+      : AggregateBox<FunctionPointerBox, RawPointerBox> {
+
+    static constexpr unsigned numExtraInhabitants =
+        FunctionPointerBox::numExtraInhabitants;
+
+    static void storeExtraInhabitant(char *dest, int index) {
+      FunctionPointerBox::storeExtraInhabitant((void **)dest, index);
+    }
+
+    static int getExtraInhabitantIndex(const char *src) {
+      return FunctionPointerBox::getExtraInhabitantIndex((void *const *)src);
+    }
+  };
 } // end anonymous namespace
 
-/// The basic value-witness table for function types.
+/// The basic value-witness table for escaping function types.
 const ExtraInhabitantsValueWitnessTable
   swift::VALUE_WITNESS_SYM(FUNCTION_MANGLING) =
     ValueWitnessTableForBox<ThickFunctionBox>::table;
+
+/// The basic value-witness table for @noescape function types.
+const ExtraInhabitantsValueWitnessTable
+  swift::VALUE_WITNESS_SYM(NOESCAPE_FUNCTION_MANGLING) =
+    ValueWitnessTableForBox<TrivialThickFunctionBox>::table;
 
 /// The basic value-witness table for thin function types.
 const ExtraInhabitantsValueWitnessTable
@@ -156,20 +161,9 @@ const ValueWitnessTable swift::VALUE_WITNESS_SYM(EMPTY_TUPLE_MANGLING) =
     { &VALUE_WITNESS_SYM(TYPE) },                             \
     { { MetadataKind::Opaque } }                 \
   };
-OPAQUE_METADATA(Bi8_)
-OPAQUE_METADATA(Bi16_)
-OPAQUE_METADATA(Bi32_)
-OPAQUE_METADATA(Bi64_)
-OPAQUE_METADATA(Bi128_)
-OPAQUE_METADATA(Bi256_)
-OPAQUE_METADATA(Bi512_)
-OPAQUE_METADATA(Bo)
-OPAQUE_METADATA(Bb)
-OPAQUE_METADATA(Bp)
-OPAQUE_METADATA(BB)
-#if SWIFT_OBJC_INTEROP
-OPAQUE_METADATA(BO)
-#endif
+#define BUILTIN_TYPE(Symbol, Name) \
+  OPAQUE_METADATA(Symbol)
+#include "swift/Runtime/BuiltinTypes.def"
 
 /// The standard metadata for the empty tuple.
 const FullMetadata<TupleTypeMetadata> swift::
@@ -181,3 +175,4 @@ METADATA_SYM(EMPTY_TUPLE_MANGLING) = {
     nullptr                    // Labels
   }
 };
+

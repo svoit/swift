@@ -139,7 +139,8 @@ static void nmModule(SILModule *M) {
 }
 
 int main(int argc, char **argv) {
-  INITIALIZE_LLVM(argc, argv);
+  PROGRAM_START(argc, argv);
+  INITIALIZE_LLVM();
 
   llvm::cl::ParseCommandLineOptions(argc, argv, "SIL NM\n");
 
@@ -170,8 +171,9 @@ int main(int argc, char **argv) {
 
   serialization::ExtendedValidationInfo extendedInfo;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
-      Invocation.setUpInputForSILTool(InputFilename, ModuleName, true,
-                                      extendedInfo);
+      Invocation.setUpInputForSILTool(InputFilename, ModuleName,
+                                      /*alwaysSetModuleToMain*/ true,
+                                      /*bePrimary*/ false, extendedInfo);
   if (!FileBufOrErr) {
     fprintf(stderr, "Error! Failed to open file: %s\n", InputFilename.c_str());
     exit(-1);

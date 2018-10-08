@@ -26,24 +26,23 @@
 
 using namespace swift;
 
-static bool shouldPrintAsFavorable(const Decl *D, PrintOptions &Options) {
+static bool shouldPrintAsFavorable(const Decl *D, const PrintOptions &Options) {
   if (!Options.TransformContext ||
       !D->getDeclContext()->isExtensionContext() ||
       !Options.TransformContext->isPrintingSynthesizedExtension())
     return true;
-  NominalTypeDecl *Target = Options.TransformContext->getNominal();
-  Type BaseTy = Target->getDeclaredTypeInContext();
+  auto DC = Options.TransformContext->getDeclContext();
+  auto BaseTy = Options.TransformContext->getBaseType();
   const auto *FD = dyn_cast<FuncDecl>(D);
   if (!FD)
     return true;
   ResolvedMemberResult Result =
-  resolveValueMember(*Target->getDeclContext(), BaseTy,
-                     FD->getEffectiveFullName());
+      resolveValueMember(*DC, BaseTy, FD->getEffectiveFullName());
   return !(Result.hasBestOverload() && Result.getBestOverload() != D);
 }
 
 class ModulePrinterPrintableChecker: public ShouldPrintChecker {
-  bool shouldPrint(const Decl *D, PrintOptions &Options) override {
+  bool shouldPrint(const Decl *D, const PrintOptions &Options) override {
     if (!shouldPrintAsFavorable(D, Options))
       return false;
     return ShouldPrintChecker::shouldPrint(D, Options);
@@ -122,9 +121,11 @@ struct SynthesizedExtensionAnalyzer::Implementation {
   struct SynthesizedExtensionInfo {
     ExtensionDecl *Ext = nullptr;
     bool IsSynthesized;
+    ExtensionDecl *EnablingExt = nullptr;
     operator bool() const { return Ext; }
-    SynthesizedExtensionInfo(bool IsSynthesized = true) :
-    IsSynthesized(IsSynthesized) {}
+    SynthesizedExtensionInfo(bool IsSynthesized = false,
+                             ExtensionDecl *EnablingExt = nullptr)
+        : IsSynthesized(IsSynthesized), EnablingExt(EnablingExt) {}
     bool operator< (const SynthesizedExtensionInfo& Rhs) const {
 
       // Synthesized are always after actual ones.
@@ -146,6 +147,7 @@ struct SynthesizedExtensionAnalyzer::Implementation {
           return LeftOrder.getValue() < RightOrder.getValue();
         }
       }
+
       return false;
     }
   };
@@ -197,8 +199,10 @@ struct SynthesizedExtensionAnalyzer::Implementation {
     }
   };
 
-  typedef llvm::MapVector<ExtensionDecl*, SynthesizedExtensionInfo> ExtensionInfoMap;
-  typedef llvm::MapVector<ExtensionDecl*, ExtensionMergeInfo> ExtensionMergeInfoMap;
+  using ExtensionInfoMap =
+      llvm::MapVector<ExtensionDecl *, SynthesizedExtensionInfo>;
+  using ExtensionMergeInfoMap =
+      llvm::MapVector<ExtensionDecl *, ExtensionMergeInfo>;
 
   struct ExtensionMergeGroup {
 
@@ -238,7 +242,7 @@ struct SynthesizedExtensionAnalyzer::Implementation {
     }
   };
 
-  typedef std::vector<ExtensionMergeGroup> MergeGroupVector;
+  using MergeGroupVector = std::vector<ExtensionMergeGroup>;
 
   NominalTypeDecl *Target;
   Type BaseType;
@@ -259,72 +263,72 @@ struct SynthesizedExtensionAnalyzer::Implementation {
   InfoMap(collectSynthesizedExtensionInfo(AllGroups)) {}
 
   unsigned countInherits(ExtensionDecl *ED) {
-    unsigned Count = 0;
-    for (auto TL : ED->getInherited()) {
-      auto *nominal = TL.getType()->getAnyNominal();
-      if (nominal && Options.shouldPrint(nominal))
-        Count ++;
-    }
-    return Count;
+    SmallVector<TypeLoc, 4> Results;
+    getInheritedForPrinting(
+        ED, [&](const Decl *D) { return Options.shouldPrint(D); }, Results);
+    return Results.size();
   }
 
   std::pair<SynthesizedExtensionInfo, ExtensionMergeInfo>
-  isApplicable(ExtensionDecl *Ext, bool IsSynthesized) {
-    SynthesizedExtensionInfo Result(IsSynthesized);
+  isApplicable(ExtensionDecl *Ext, bool IsSynthesized,
+               ExtensionDecl *EnablingExt, NormalProtocolConformance *Conf) {
+    SynthesizedExtensionInfo Result(IsSynthesized, EnablingExt);
     ExtensionMergeInfo MergeInfo;
     MergeInfo.HasDocComment = !Ext->getRawComment().isEmpty();
     MergeInfo.InheritsCount = countInherits(Ext);
-    if (!Ext->isConstrainedExtension()) {
+
+    // There's (up to) two extensions here: the extension with the items that we
+    // might be merging, plus the "enabling extension", which is the route
+    // through which \c Ext itself applies, e.g. extension SomeProtocol {}
+    // extension SomeType: SomeProtocol where T: SomeProtocol {}. The former is
+    // Ext and the latter is EnablingExt/Conf. Either of these can be
+    // conditional in ways that need to be considered when merging.
+    auto conformanceIsConditional =
+        Conf && !Conf->getConditionalRequirements().empty();
+    if (!Ext->isConstrainedExtension() && !conformanceIsConditional) {
       if (IncludeUnconditional)
         Result.Ext = Ext;
       return {Result, MergeInfo};
     }
 
-    // Get the substitutions from the generic signature of
-    // the extension to the interface types of the base type's
-    // declaration.
-    auto *M = DC->getParentModule();
-    SubstitutionMap subMap;
-    if (!BaseType->isExistentialType())
-      subMap = BaseType->getContextSubstitutionMap(M, Ext);
+    auto handleRequirements = [&](SubstitutionMap subMap,
+                                  GenericSignature *GenericSig,
+                                  ArrayRef<Requirement> Reqs) {
+      for (auto Req : Reqs) {
+        auto Kind = Req.getKind();
 
-    assert(Ext->getGenericSignature() && "No generic signature.");
-    auto GenericSig = Ext->getGenericSignature();
-    for (auto Req : GenericSig->getRequirements()) {
-      auto Kind = Req.getKind();
+        // FIXME: Could do something here
+        if (Kind == RequirementKind::Layout)
+          continue;
 
-      // FIXME: Could do something here
-      if (Kind == RequirementKind::Layout)
-        continue;
+        auto First = Req.getFirstType();
+        auto Second = Req.getSecondType();
+        if (!BaseType->isExistentialType()) {
+          First = First.subst(subMap);
+          Second = Second.subst(subMap);
 
-      auto First = Req.getFirstType();
-      auto Second = Req.getSecondType();
-      if (!BaseType->isExistentialType()) {
-        First = First.subst(subMap);
-        Second = Second.subst(subMap);
-
-        if (!First || !Second) {
-          // Substitution with interface type bases can only fail
-          // if a concrete type fails to conform to a protocol.
-          // In this case, just give up on the extension altogether.
-          return {Result, MergeInfo};
+          if (!First || !Second) {
+            // Substitution with interface type bases can only fail
+            // if a concrete type fails to conform to a protocol.
+            // In this case, just give up on the extension altogether.
+            return true;
+          }
         }
-      }
 
-      switch (Kind) {
+        switch (Kind) {
         case RequirementKind::Conformance:
         case RequirementKind::Superclass:
           // FIXME: This could be more accurate; check
           // conformance instead of subtyping
           if (!canPossiblyConvertTo(First, Second, *DC))
-            return {Result, MergeInfo};
+            return true;
           else if (!isConvertibleTo(First, Second, *DC))
             MergeInfo.addRequirement(GenericSig, First, Second, Kind);
           break;
 
         case RequirementKind::SameType:
           if (!canPossiblyEqual(First, Second, *DC)) {
-            return {Result, MergeInfo};
+            return true;
           } else if (!First->isEqual(Second)) {
             MergeInfo.addRequirement(GenericSig, First, Second, Kind);
           }
@@ -332,8 +336,31 @@ struct SynthesizedExtensionAnalyzer::Implementation {
 
         case RequirementKind::Layout:
           llvm_unreachable("Handled above");
+        }
       }
+      return false;
+    };
+
+    auto *M = DC->getParentModule();
+    if (Ext->isConstrainedExtension()) {
+      // Get the substitutions from the generic signature of
+      // the extension to the interface types of the base type's
+      // declaration.
+      SubstitutionMap subMap;
+      if (!BaseType->isExistentialType())
+        subMap = BaseType->getContextSubstitutionMap(M, Ext);
+
+      assert(Ext->getGenericSignature() && "No generic signature.");
+      auto GenericSig = Ext->getGenericSignature();
+      if (handleRequirements(subMap, GenericSig, GenericSig->getRequirements()))
+        return {Result, MergeInfo};
     }
+
+    if (Conf && handleRequirements(Conf->getSubstitutions(M),
+                                   Conf->getGenericSignature(),
+                                   Conf->getConditionalRequirements()))
+      return {Result, MergeInfo};
+
     Result.Ext = Ext;
     return {Result, MergeInfo};
   }
@@ -368,7 +395,9 @@ struct SynthesizedExtensionAnalyzer::Implementation {
     for (auto *E : Target->getExtensions()) {
       if (!Options.shouldPrint(E))
         continue;
-      auto Pair = isApplicable(E, /*Synthesized*/false);
+      auto Pair = isApplicable(E, /*Synthesized*/ false,
+                               /*EnablingExt*/ nullptr,
+                               /*Conf*/ nullptr);
       if (Pair.first) {
         InfoMap->insert({E, Pair.first});
         MergeInfoMap.insert({E, Pair.second});
@@ -400,9 +429,11 @@ struct SynthesizedExtensionAnalyzer::Implementation {
     ExtensionMergeInfoMap MergeInfoMap;
     std::vector<NominalTypeDecl*> Unhandled;
 
-    auto handleExtension = [&](ExtensionDecl *E, bool Synthesized) {
+    auto handleExtension = [&](ExtensionDecl *E, bool Synthesized,
+                               ExtensionDecl *EnablingE,
+                               NormalProtocolConformance *Conf) {
       if (Options.shouldPrint(E)) {
-        auto Pair = isApplicable(E, Synthesized);
+        auto Pair = isApplicable(E, Synthesized, EnablingE, Conf);
         if (Pair.first) {
           InfoMap->insert({E, Pair.first});
           MergeInfoMap.insert({E, Pair.second});
@@ -414,14 +445,14 @@ struct SynthesizedExtensionAnalyzer::Implementation {
       Unhandled.push_back(Conf->getProtocol());
     }
     if (auto *CD = dyn_cast<ClassDecl>(Target)) {
-      if (auto Super = CD->getSuperclass())
-        Unhandled.push_back(Super->getAnyNominal());
+      if (auto Super = CD->getSuperclassDecl())
+        Unhandled.push_back(Super);
     }
     while (!Unhandled.empty()) {
       NominalTypeDecl* Back = Unhandled.back();
       Unhandled.pop_back();
       for (ExtensionDecl *E : Back->getExtensions()) {
-        handleExtension(E, true);
+        handleExtension(E, true, nullptr, nullptr);
       }
       for (auto *Conf : Back->getLocalConformances()) {
         Unhandled.push_back(Conf->getProtocol());
@@ -433,11 +464,11 @@ struct SynthesizedExtensionAnalyzer::Implementation {
     }
 
     // Merge with actual extensions.
-    for (auto *E : Target->getExtensions()) {
-      handleExtension(E, false);
-      for (auto *Conf : E->getLocalConformances()) {
+    for (auto *EnablingE : Target->getExtensions()) {
+      handleExtension(EnablingE, false, nullptr, nullptr);
+      for (auto *Conf : EnablingE->getLocalConformances()) {
         for (auto E : Conf->getProtocol()->getExtensions())
-          handleExtension(E, true);
+          handleExtension(E, true, EnablingE, Conf->getRootNormalConformance());
       }
     }
 
@@ -482,9 +513,10 @@ forEachExtensionMergeGroup(MergeGroupKind Kind, ExtensionGroupOperation Fn) {
       if (Kind != Group.Kind)
         continue;
     }
-    std::vector<ExtensionAndIsSynthesized> GroupContent;
+    std::vector<ExtensionInfo> GroupContent;
     for (auto &Member : Group.Members) {
-      GroupContent.push_back({Member->Ext, Member->IsSynthesized});
+      GroupContent.push_back(
+          {Member->Ext, Member->EnablingExt, Member->IsSynthesized});
     }
     Fn(llvm::makeArrayRef(GroupContent));
   }
@@ -504,8 +536,6 @@ hasMergeGroup(MergeGroupKind Kind) {
 void swift::
 collectDefaultImplementationForProtocolMembers(ProtocolDecl *PD,
                     llvm::SmallDenseMap<ValueDecl*, ValueDecl*> &DefaultMap) {
-  Type BaseTy = PD->getDeclaredInterfaceType();
-  DeclContext *DC = PD->getInnermostDeclContext();
   auto HandleMembers = [&](DeclRange Members) {
     for (Decl *D : Members) {
       auto *VD = dyn_cast<ValueDecl>(D);
@@ -518,11 +548,8 @@ collectDefaultImplementationForProtocolMembers(ProtocolDecl *PD,
       if (VD->getBaseName().empty())
         continue;
 
-      ResolvedMemberResult Result = resolveValueMember(*DC, BaseTy,
-                                                       VD->getFullName());
-      assert(Result);
-      for (auto *Default : Result.getMemberDecls(InterestedMemberKind::All)) {
-        if (PD == Default->getDeclContext()->getAsProtocolExtensionContext()) {
+      for (auto *Default: PD->lookupDirect(VD->getFullName())) {
+        if (Default->getDeclContext()->getExtendedProtocolDecl() == PD) {
           DefaultMap.insert({Default, VD});
         }
       }

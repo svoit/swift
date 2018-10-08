@@ -81,15 +81,16 @@ private:
     return OtherPrinter.printModuleRef(Mod, Name);
   }
   void printSynthesizedExtensionPre(const ExtensionDecl *ED,
-                                    const NominalTypeDecl *NTD,
+                                    TypeOrExtensionDecl Target,
                                     Optional<BracketOptions> Bracket) override {
-    return OtherPrinter.printSynthesizedExtensionPre(ED, NTD, Bracket);
+    return OtherPrinter.printSynthesizedExtensionPre(ED, Target, Bracket);
   }
 
-  void printSynthesizedExtensionPost(const ExtensionDecl *ED,
-                                     const NominalTypeDecl *NTD,
-                                     Optional<BracketOptions> Bracket) override {
-    return OtherPrinter.printSynthesizedExtensionPost(ED, NTD, Bracket);
+  void
+  printSynthesizedExtensionPost(const ExtensionDecl *ED,
+                                TypeOrExtensionDecl Target,
+                                Optional<BracketOptions> Bracket) override {
+    return OtherPrinter.printSynthesizedExtensionPost(ED, Target, Bracket);
   }
 
   void printStructurePre(PrintStructureKind Kind, const Decl *D) override {
@@ -206,8 +207,6 @@ static void adjustPrintOptions(PrintOptions &AdjustedOptions) {
   // Print var declarations separately, one variable per decl.
   AdjustedOptions.ExplodePatternBindingDecls = true;
   AdjustedOptions.VarInitializers = false;
-
-  AdjustedOptions.PrintDefaultParameterPlaceholder = true;
 }
 
 ArrayRef<StringRef>
@@ -232,8 +231,9 @@ static ClangNode getEffectiveClangNode(const Decl *decl) {
   if (auto nominal =
         const_cast<NominalTypeDecl *>(dyn_cast<NominalTypeDecl>(decl))) {
     auto &ctx = nominal->getASTContext();
-    for (auto code : nominal->lookupDirect(ctx.Id_Code,
-                                           /*ignoreNewExtensions=*/true)) {
+    auto flags = OptionSet<NominalTypeDecl::LookupDirectFlags>();
+    flags |= NominalTypeDecl::LookupDirectFlags::IgnoreNewExtensions;
+    for (auto code : nominal->lookupDirect(ctx.Id_Code, flags)) {
       if (auto clangDecl = code->getClangDecl())
         return clangDecl;
     }
@@ -364,7 +364,6 @@ void swift::ide::printSubmoduleInterface(
     // Skip declarations that are not accessible.
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
       if (Options.AccessFilter > AccessLevel::Private &&
-          VD->hasAccess() &&
           VD->getFormalAccess() < Options.AccessFilter)
         continue;
     }
@@ -496,7 +495,7 @@ void swift::ide::printSubmoduleInterface(
   // If the group name is specified, we sort them according to their source order,
   // which is the order preserved by getTopLevelDecls.
   if (GroupNames.empty()) {
-    std::sort(SwiftDecls.begin(), SwiftDecls.end(),
+    std::stable_sort(SwiftDecls.begin(), SwiftDecls.end(),
       [&](Decl *LHS, Decl *RHS) -> bool {
         auto *LHSValue = dyn_cast<ValueDecl>(LHS);
         auto *RHSValue = dyn_cast<ValueDecl>(RHS);
@@ -532,7 +531,7 @@ void swift::ide::printSubmoduleInterface(
       // Swift extensions are printed with their associated type unless it's
       // a cross-module extension.
       if (!extensionHasClangNode(Ext)) {
-        auto ExtendedNominal = Ext->getExtendedType()->getAnyNominal();
+        auto ExtendedNominal = Ext->getExtendedNominal();
         if (Ext->getModuleContext() == ExtendedNominal->getModuleContext())
           return false;
       }
@@ -589,20 +588,22 @@ void swift::ide::printSubmoduleInterface(
           if (IsTopLevelDecl) {
           // Print the part that should be merged with the type decl.
           pAnalyzer->forEachExtensionMergeGroup(
-            SynthesizedExtensionAnalyzer::MergeGroupKind::MergeableWithTypeDef,
-            [&](ArrayRef<ExtensionAndIsSynthesized> Decls){
-              for (auto ET : Decls) {
-                AdjustedOptions.BracketOptions = {ET.first, false,
-                                        Decls.back().first == ET.first, true};
-                if (ET.second)
-                  AdjustedOptions.initForSynthesizedExtension(NTD);
-                ET.first->print(Printer, AdjustedOptions);
-                if (ET.second)
-                  AdjustedOptions.clearSynthesizedExtension();
-                if (AdjustedOptions.BracketOptions.shouldCloseExtension(ET.first))
-                  Printer << "\n";
-              }
-          });
+              SynthesizedExtensionAnalyzer::MergeGroupKind::
+                  MergeableWithTypeDef,
+              [&](ArrayRef<ExtensionInfo> Decls) {
+                for (auto ET : Decls) {
+                  AdjustedOptions.BracketOptions = {
+                      ET.Ext, false, Decls.back().Ext == ET.Ext, true};
+                  if (ET.IsSynthesized)
+                    AdjustedOptions.initForSynthesizedExtension(NTD);
+                  ET.Ext->print(Printer, AdjustedOptions);
+                  if (ET.IsSynthesized)
+                    AdjustedOptions.clearSynthesizedExtension();
+                  if (AdjustedOptions.BracketOptions.shouldCloseExtension(
+                          ET.Ext))
+                    Printer << "\n";
+                }
+              });
           }
 
           // If the printed Decl is not the top-level one, reset analyzer.
@@ -611,28 +612,38 @@ void swift::ide::printSubmoduleInterface(
 
           // Print the rest as synthesized extensions.
           pAnalyzer->forEachExtensionMergeGroup(
-            // For top-level decls, only constraint extensions are to print;
-            // Since the rest are merged into the main body.
-            IsTopLevelDecl ?
-              SynthesizedExtensionAnalyzer::MergeGroupKind::UnmergeableWithTypeDef :
-            // For sub-decls, all extensions should be printed.
-              SynthesizedExtensionAnalyzer::MergeGroupKind::All,
-            [&](ArrayRef<ExtensionAndIsSynthesized> Decls){
-              for (auto ET : Decls) {
-                AdjustedOptions.BracketOptions = {ET.first,
-                  Decls.front().first == ET.first,
-                  Decls.back().first == ET.first, true};
-                if (AdjustedOptions.BracketOptions.shouldOpenExtension(ET.first))
-                  Printer << "\n";
-                if (ET.second)
-                  AdjustedOptions.initForSynthesizedExtension(NTD);
-                ET.first->print(Printer, AdjustedOptions);
-                if (ET.second)
-                  AdjustedOptions.clearSynthesizedExtension();
-                if (AdjustedOptions.BracketOptions.shouldCloseExtension(ET.first))
-                  Printer << "\n";
-            }
-          });
+              // For top-level decls, only constraint extensions need to be
+              // printed, since the rest are merged into the main body.
+              IsTopLevelDecl ? SynthesizedExtensionAnalyzer::MergeGroupKind::
+                                   UnmergeableWithTypeDef
+                             :
+                             // For sub-decls, all extensions should be printed.
+                  SynthesizedExtensionAnalyzer::MergeGroupKind::All,
+              [&](ArrayRef<ExtensionInfo> Decls) {
+                // Whether we've started the extension merge group in printing.
+                bool Opened = false;
+                for (auto ET : Decls) {
+                  AdjustedOptions.BracketOptions = { ET.Ext, !Opened,
+                    Decls.back().Ext == ET.Ext, true};
+                  if (AdjustedOptions.BracketOptions.shouldOpenExtension(
+                          ET.Ext))
+                    Printer << "\n";
+                  if (ET.IsSynthesized) {
+                    if (ET.EnablingExt)
+                      AdjustedOptions.initForSynthesizedExtension(
+                          ET.EnablingExt);
+                    else
+                      AdjustedOptions.initForSynthesizedExtension(NTD);
+                  }
+                  // Set opened if we actually printed this extension.
+                  Opened |= ET.Ext->print(Printer, AdjustedOptions);
+                  if (ET.IsSynthesized)
+                    AdjustedOptions.clearSynthesizedExtension();
+                  if (AdjustedOptions.BracketOptions.shouldCloseExtension(
+                          ET.Ext))
+                    Printer << "\n";
+                }
+              });
           AdjustedOptions.BracketOptions = BracketOptions();
         }
       }

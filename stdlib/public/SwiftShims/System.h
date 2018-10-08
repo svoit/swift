@@ -62,6 +62,10 @@
 #define SWIFT_ABI_DEFAULT_OBJC_WEAK_REFERENCE_MARKER_MASK 0
 #define SWIFT_ABI_DEFAULT_OBJC_WEAK_REFERENCE_MARKER_VALUE 0
 
+// BridgeObject uses this bit to indicate a tagged value.
+#define SWIFT_ABI_DEFAULT_BRIDGEOBJECT_TAG_32 0U
+#define SWIFT_ABI_DEFAULT_BRIDGEOBJECT_TAG_64 0x8000000000000000ULL
+
 /*********************************** i386 *************************************/
 
 // Heap objects are pointer-aligned, so the low two bits are unused.
@@ -73,6 +77,10 @@
    1<<SWIFT_ABI_DEFAULT_OBJC_NUM_RESERVED_LOW_BITS)
 #define SWIFT_ABI_I386_OBJC_WEAK_REFERENCE_MARKER_VALUE \
   (1<<SWIFT_ABI_DEFAULT_OBJC_NUM_RESERVED_LOW_BITS)
+
+// BridgeObject uses this bit to indicate whether it holds an ObjC object or
+// not.
+#define SWIFT_ABI_I386_IS_OBJC_BIT 0x00000002U
 
 /*********************************** arm **************************************/
 
@@ -86,6 +94,10 @@
 #define SWIFT_ABI_ARM_OBJC_WEAK_REFERENCE_MARKER_VALUE \
   (1<<SWIFT_ABI_DEFAULT_OBJC_NUM_RESERVED_LOW_BITS)
 
+// BridgeObject uses this bit to indicate whether it holds an ObjC object or
+// not.
+#define SWIFT_ABI_ARM_IS_OBJC_BIT 0x00000002U
+
 /*********************************** x86-64 ***********************************/
 
 /// Darwin reserves the low 4GB of address space.
@@ -94,18 +106,30 @@
 // Only the bottom 56 bits are used, and heap objects are eight-byte-aligned.
 #define SWIFT_ABI_X86_64_SWIFT_SPARE_BITS_MASK 0xFF00000000000007ULL
 
-// Objective-C reserves the high and low bits for tagged pointers.
-// Systems exist which use either bit.
-#define SWIFT_ABI_X86_64_OBJC_RESERVED_BITS_MASK 0x8000000000000001ULL
+// Objective-C reserves the low bit for tagged pointers on macOS, but
+// reserves the high bit on simulators.
+#define SWIFT_ABI_X86_64_OBJC_RESERVED_BITS_MASK 0x0000000000000001ULL
 #define SWIFT_ABI_X86_64_OBJC_NUM_RESERVED_LOW_BITS 1
+#define SWIFT_ABI_X86_64_SIMULATOR_OBJC_RESERVED_BITS_MASK 0x8000000000000000ULL
+#define SWIFT_ABI_X86_64_SIMULATOR_OBJC_NUM_RESERVED_LOW_BITS 0
 
-// ObjC weak reference discriminator is the two bits
-// reserved for ObjC tagged pointers plus one more low bit.
+
+// BridgeObject uses this bit to indicate whether it holds an ObjC object or
+// not.
+#define SWIFT_ABI_X86_64_IS_OBJC_BIT 0x4000000000000000ULL
+
+// ObjC weak reference discriminator is the bit reserved for ObjC tagged
+// pointers plus one more low bit.
 #define SWIFT_ABI_X86_64_OBJC_WEAK_REFERENCE_MARKER_MASK  \
   (SWIFT_ABI_X86_64_OBJC_RESERVED_BITS_MASK |          \
    1<<SWIFT_ABI_X86_64_OBJC_NUM_RESERVED_LOW_BITS)
 #define SWIFT_ABI_X86_64_OBJC_WEAK_REFERENCE_MARKER_VALUE \
   (1<<SWIFT_ABI_X86_64_OBJC_NUM_RESERVED_LOW_BITS)
+#define SWIFT_ABI_X86_64_SIMULATOR_OBJC_WEAK_REFERENCE_MARKER_MASK  \
+  (SWIFT_ABI_X86_64_SIMULATOR_OBJC_RESERVED_BITS_MASK |          \
+   1<<SWIFT_ABI_X86_64_SIMULATOR_OBJC_NUM_RESERVED_LOW_BITS)
+#define SWIFT_ABI_X86_64_SIMULATOR_OBJC_WEAK_REFERENCE_MARKER_VALUE \
+  (1<<SWIFT_ABI_X86_64_SIMULATOR_OBJC_NUM_RESERVED_LOW_BITS)
 
 /*********************************** arm64 ************************************/
 
@@ -119,6 +143,10 @@
 // Objective-C reserves just the high bit for tagged pointers.
 #define SWIFT_ABI_ARM64_OBJC_RESERVED_BITS_MASK 0x8000000000000000ULL
 #define SWIFT_ABI_ARM64_OBJC_NUM_RESERVED_LOW_BITS 0
+
+// BridgeObject uses this bit to indicate whether it holds an ObjC object or
+// not.
+#define SWIFT_ABI_ARM64_IS_OBJC_BIT 0x4000000000000000ULL
 
 // ObjC weak reference discriminator is the high bit
 // reserved for ObjC tagged pointers plus the LSB.

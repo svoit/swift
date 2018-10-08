@@ -55,13 +55,14 @@ private:
 public:
   FormatterDocument(std::unique_ptr<llvm::MemoryBuffer> Buffer) {
     // Formatting logic requires tokens on source file.
-    CompInv.getLangOptions().KeepSyntaxInfoInSourceFile = true;
+    CompInv.getLangOptions().CollectParsedToken = true;
     updateCode(std::move(Buffer));
   }
 
   void updateCode(std::unique_ptr<llvm::MemoryBuffer> Buffer) {
     BufferID = SM.addNewSourceBuffer(std::move(Buffer));
-    Parser.reset(new ParserUnit(SM, BufferID, CompInv.getLangOptions(),
+    Parser.reset(new ParserUnit(SM, SourceFileKind::Main,
+                                BufferID, CompInv.getLangOptions(),
                                 CompInv.getModuleName()));
     Parser->getDiagnosticEngine().addConsumer(DiagConsumer);
     auto &P = Parser->getParser();
@@ -152,7 +153,8 @@ public:
     if (ParsedArgs.getLastArg(OPT_help)) {
       std::string ExecutableName = llvm::sys::path::stem(MainExecutablePath);
       Table->PrintHelp(llvm::outs(), ExecutableName.c_str(),
-                       "Swift Format Tool", options::SwiftFormatOption, 0);
+                       "Swift Format Tool", options::SwiftFormatOption, 0,
+                       /*ShowAllAliases*/false);
       return 1;
     }
 

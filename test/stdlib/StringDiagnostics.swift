@@ -7,27 +7,19 @@ import Foundation
 // Common pitfall: trying to subscript a string with integers.
 func testIntSubscripting(s: String, i: Int) {
   // FIXME swift-3-indexing-model: test new overloads of ..<, ...
-  _ = s[i] // expected-error{{'subscript' is unavailable: cannot subscript String with an Int, see the documentation comment for discussion}}
-  _ = s[17] // expected-error{{'subscript' is unavailable: cannot subscript String with an Int, see the documentation comment for discussion}}
-  _ = s[i...i] // expected-error{{subscript' is unavailable: cannot subscript String with a CountableClosedRange<Int>, see the documentation comment for discussion}}
-  _ = s[17..<20] // expected-error{{subscript' is unavailable: cannot subscript String with a CountableRange<Int>, see the documentation comment for discussion}}
-  _ = s[17...20] // expected-error{{subscript' is unavailable: cannot subscript String with a CountableClosedRange<Int>, see the documentation comment for discussion}}
+  _ = s[i] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an Int, see the documentation comment for discussion}}
+  _ = s[17] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an Int, see the documentation comment for discussion}}
+  _ = s[i...i] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[17..<20] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[17...20] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
 
-  _ = s[Range(i...i)] // expected-error{{subscript' is unavailable: cannot subscript String with a Range<Int>, see the documentation comment for discussion}}
-  _ = s[Range(17..<20)] // expected-error{{subscript' is unavailable: cannot subscript String with a Range<Int>, see the documentation comment for discussion}}
-  _ = s[Range(17...20)] // expected-error{{subscript' is unavailable: cannot subscript String with a Range<Int>, see the documentation comment for discussion}}
+  _ = s[Range(i...i)] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[Range(17..<20)] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[Range(17...20)] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
 
-  _ = s[CountableRange(i...i)] // expected-error{{subscript' is unavailable: cannot subscript String with a CountableRange<Int>, see the documentation comment for discussion}}
-  _ = s[CountableRange(17..<20)] // expected-error{{subscript' is unavailable: cannot subscript String with a CountableRange<Int>, see the documentation comment for discussion}}
-  _ = s[CountableRange(17...20)] // expected-error{{subscript' is unavailable: cannot subscript String with a CountableRange<Int>, see the documentation comment for discussion}}
-
-  _ = s[ClosedRange(i...i)] // expected-error{{subscript' is unavailable: cannot subscript String with a ClosedRange<Int>, see the documentation comment for discussion}}
-  _ = s[ClosedRange(17..<20)] // expected-error{{subscript' is unavailable: cannot subscript String with a ClosedRange<Int>, see the documentation comment for discussion}}
-  _ = s[ClosedRange(17...20)] // expected-error{{subscript' is unavailable: cannot subscript String with a ClosedRange<Int>, see the documentation comment for discussion}}
-
-  _ = s[CountableClosedRange(i...i)] // expected-error{{subscript' is unavailable: cannot subscript String with a CountableClosedRange<Int>, see the documentation comment for discussion}}
-  _ = s[CountableClosedRange(17..<20)] // expected-error{{subscript' is unavailable: cannot subscript String with a CountableClosedRange<Int>, see the documentation comment for discussion}}
-  _ = s[CountableClosedRange(17...20)] // expected-error{{subscript' is unavailable: cannot subscript String with a CountableClosedRange<Int>, see the documentation comment for discussion}}
+  _ = s[Range(i...i)] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[Range(17..<20)] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
+  _ = s[Range(17...20)] // expected-error{{'subscript(_:)' is unavailable: cannot subscript String with an integer range, see the documentation comment for discussion}}
 }
 
 func testNonAmbiguousStringComparisons() {
@@ -60,10 +52,10 @@ func testAmbiguousStringComparisons(s: String) {
 
 func testStringDeprecation(hello: String) {
   let hello2 = hello
-    .addingPercentEscapes(using: .utf8) // expected-warning{{'addingPercentEscapes(using:)' is deprecated}}
+    .addingPercentEscapes(using: .utf8) // expected-error{{'addingPercentEscapes(using:)' is unavailable}}
 
   _ = hello2?
-    .replacingPercentEscapes(using: .utf8) // expected-warning{{'replacingPercentEscapes(using:)' is deprecated}}
+    .replacingPercentEscapes(using: .utf8) // expected-error{{'replacingPercentEscapes(using:)' is unavailable}}
 }
 
 // Positive and negative tests for String collection types. Testing the complete

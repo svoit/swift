@@ -29,13 +29,6 @@ using namespace swift;
 /// changes that cause the asserts the fire, please update them. The purpose is
 /// to prevent these predicates from changing values by mistake.
 
-// SILNode uses its padding bits to delegate space to its subclasses. That being
-// said, we do not want to by mistake increase the size as our usage of the
-// padding bits changes over time. So we assert that our value is still exactly
-// 8 bytes in size.
-static_assert((sizeof(SILNode) * 8) == SILNode::NumTotalSILNodeBits,
-              "Expected SILNode to be exactly 8 bytes in size");
-
 //===----------------------------------------------------------------------===//
 //                       Check SILValue Type Properties
 //===----------------------------------------------------------------------===//
@@ -293,3 +286,43 @@ StringRef swift::getSILValueName(ValueKind Kind) {
   }
 }
 #endif
+
+//===----------------------------------------------------------------------===//
+//                          OperandOwnershipKindMap
+//===----------------------------------------------------------------------===//
+
+void OperandOwnershipKindMap::print(llvm::raw_ostream &os) const {
+  os << "-- OperandOwnershipKindMap --\n";
+
+  unsigned index = 0;
+  unsigned end = unsigned(ValueOwnershipKind::LastValueOwnershipKind) + 1;
+  while (index != end) {
+    auto kind = ValueOwnershipKind(index);
+    if (canAcceptKind(kind)) {
+      os << kind << ": Yes. Liveness: " << getLifetimeConstraint(kind) << "\n";
+    } else {
+      os << kind << ":  No."
+         << "\n";
+    }
+    ++index;
+  }
+}
+
+void OperandOwnershipKindMap::dump() const { print(llvm::dbgs()); }
+
+//===----------------------------------------------------------------------===//
+//                           UseLifetimeConstraint
+//===----------------------------------------------------------------------===//
+
+llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &os,
+                                     UseLifetimeConstraint constraint) {
+  switch (constraint) {
+  case UseLifetimeConstraint::MustBeLive:
+    os << "MustBeLive";
+    break;
+  case UseLifetimeConstraint::MustBeInvalidated:
+    os << "MustBeInvalidated";
+    break;
+  }
+  return os;
+}

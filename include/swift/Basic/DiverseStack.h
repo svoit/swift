@@ -366,10 +366,14 @@ public:
   void pop(stable_iterator stable_iter) {
     iterator iter = find(stable_iter);
     checkIterator(iter);
+#ifndef NDEBUG
     while (Begin != iter.Ptr) {
       pop();
       checkIterator(iter);
     }
+#else
+    Begin = iter.Ptr;
+#endif
   }
 };
 
@@ -378,7 +382,7 @@ public:
 /// Allow stable_iterators to be put in things like TinyPtrVectors.
 namespace llvm {
   template <>
-  class PointerLikeTypeTraits<
+  struct PointerLikeTypeTraits<
                       swift::DiverseStackBase::stable_iterator::AsPointer> {
     using AsPointer = swift::DiverseStackBase::stable_iterator::AsPointer;
   public:

@@ -317,8 +317,7 @@ void CommentToXMLConverter::visitDocComment(const DocComment *DC) {
     auto Loc = D->getLoc();
     if (Loc.isValid()) {
       const auto &SM = D->getASTContext().SourceMgr;
-      unsigned BufferID = SM.findBufferContainingLoc(Loc);
-      StringRef FileName = SM.getIdentifierForBuffer(BufferID);
+      StringRef FileName = SM.getDisplayNameForLoc(Loc);
       auto LineAndColumn = SM.getLineAndColumn(Loc);
       OS << " file=\"";
       appendWithXMLEscaping(OS, FileName);
@@ -408,14 +407,15 @@ static void replaceObjcDeclarationsWithSwiftOnes(const Decl *D,
   std::string S;
   llvm::raw_string_ostream SS(S);
   D->print(SS, Options);
-  std::string Signature = SS.str();
   auto OI = Doc.find(Open);
   auto CI = Doc.find(Close);
-  if (StringRef::npos != OI && StringRef::npos != CI && CI > OI)
-    OS << Doc.substr(0, OI) << Open << Signature << Close <<
-      Doc.substr(CI + Close.size());
-  else
+  if (StringRef::npos != OI && StringRef::npos != CI && CI > OI) {
+    OS << Doc.substr(0, OI) << Open;
+    appendWithXMLEscaping(OS, SS.str());
+    OS << Close << Doc.substr(CI + Close.size());
+  } else {
     OS << Doc;
+  }
 }
 
 static LineList getLineListFromComment(SourceManager &SourceMgr,

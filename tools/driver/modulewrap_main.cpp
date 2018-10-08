@@ -18,10 +18,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/Basic/LLVMInitialize.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/Option/Options.h"
 #include "swift/Serialization/ModuleFormat.h"
+#include "swift/SIL/SILModule.h"
 #include "swift/Subsystems.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Bitcode/BitstreamReader.h"
@@ -43,7 +45,7 @@ private:
   std::vector<std::string> InputFilenames;
 
 public:
-  bool haveUniqueInputFilename() const { return InputFilenames.size() == 1; }
+  bool hasSingleInput() const { return InputFilenames.size() == 1; }
   const std::string &getFilenameOfFirstInput() const {
     return InputFilenames[0];
   }
@@ -89,7 +91,8 @@ public:
     if (ParsedArgs.getLastArg(OPT_help)) {
       std::string ExecutableName = llvm::sys::path::stem(MainExecutablePath);
       Table->PrintHelp(llvm::outs(), ExecutableName.c_str(),
-                       "Swift Module Wrapper", options::ModuleWrapOption, 0);
+                       "Swift Module Wrapper", options::ModuleWrapOption, 0,
+                       /*ShowAllAliases*/false);
       return 1;
     }
 
@@ -112,10 +115,7 @@ public:
 
 int modulewrap_main(ArrayRef<const char *> Args, const char *Argv0,
                     void *MainAddr) {
-  llvm::InitializeAllTargets();
-  llvm::InitializeAllTargetMCs();
-  llvm::InitializeAllAsmPrinters();
-  llvm::InitializeAllAsmParsers();
+  INITIALIZE_LLVM();
 
   CompilerInstance Instance;
   PrintingDiagnosticConsumer PDC;
@@ -131,7 +131,7 @@ int modulewrap_main(ArrayRef<const char *> Args, const char *Argv0,
     return 1;
   }
 
-  if (!Invocation.haveUniqueInputFilename()) {
+  if (!Invocation.hasSingleInput()) {
     Instance.getDiags().diagnose(SourceLoc(),
                                  diag::error_mode_requires_one_input_file);
     return 1;
@@ -169,7 +169,10 @@ int modulewrap_main(ArrayRef<const char *> Args, const char *Argv0,
   SourceManager SrcMgr;
   LangOptions LangOpts;
   LangOpts.Target = Invocation.getTargetTriple();
-  ASTContext ASTCtx(LangOpts, SearchPathOpts, SrcMgr, Instance.getDiags());
+  ASTContext &ASTCtx = *ASTContext::get(LangOpts, SearchPathOpts, SrcMgr,
+                                        Instance.getDiags());
+  registerTypeCheckerRequestFunctions(ASTCtx.evaluator);
+  
   ClangImporterOptions ClangImporterOpts;
   ASTCtx.addModuleLoader(ClangImporter::create(ASTCtx, ClangImporterOpts, ""),
                          true);

@@ -2,7 +2,7 @@
 #
 # This source file is part of the Swift.org open source project
 #
-# Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+# Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
 # Licensed under Apache License v2.0 with Runtime Library Exception
 #
 # See https://swift.org/LICENSE.txt for license information
@@ -23,12 +23,15 @@ set(SWIFTLIB_ESSENTIAL
   ArrayBuffer.swift
   ArrayBufferProtocol.swift
   ArrayCast.swift
-  Arrays.swift.gyb
+  Array.swift
+  ArrayShared.swift
+  ArraySlice.swift
   ArrayType.swift
   ASCII.swift
   Assert.swift
   AssertCommon.swift
   BidirectionalCollection.swift
+  Bitset.swift
   Bool.swift
   BridgeObjectiveC.swift
   BridgeStorage.swift
@@ -37,125 +40,152 @@ set(SWIFTLIB_ESSENTIAL
   Character.swift
   CharacterUnicodeScalars.swift
   CocoaArray.swift
-  Codable.swift
+  Codable.swift.gyb
   Collection.swift
-  CollectionAlgorithms.swift.gyb
+  CollectionAlgorithms.swift
   Comparable.swift
   CompilerProtocols.swift
+  ContiguousArray.swift
   ClosedRange.swift
   ContiguousArrayBuffer.swift
   CString.swift
   CTypes.swift
   DebuggerSupport.swift
-  # FIXME(double-width): <rdar://problem/32726173>
-  #DoubleWidth.swift.gyb
-  DropWhile.swift.gyb
+  Dictionary.swift
+  DictionaryBridging.swift
+  DictionaryBuilder.swift
+  DictionaryCasting.swift
+  DictionaryStorage.swift
+  DictionaryVariant.swift
+  DropWhile.swift
   Dump.swift
   EmptyCollection.swift
   Equatable.swift
   ErrorType.swift
-  Existential.swift
-  Filter.swift.gyb
+  Filter.swift
   FixedArray.swift.gyb
   FlatMap.swift
-  Flatten.swift.gyb
-  FloatingPoint.swift.gyb
+  Flatten.swift
+  FloatingPoint.swift
   FloatingPointParsing.swift.gyb
   FloatingPointTypes.swift.gyb
   Hashable.swift
-  HashedCollections.swift.gyb
   # WORKAROUND: This file name is not sorted alphabetically in the list because
   # if we do so, the compiler crashes.
   AnyHashable.swift
   # END WORKAROUND
-  HashedCollectionsAnyHashableExtensions.swift
+  Hasher.swift
   Hashing.swift
+  HashTable.swift
   HeapBuffer.swift
   ICU.swift
-  ImplicitlyUnwrappedOptional.swift
   Indices.swift
   InputStream.swift
   IntegerParsing.swift
-  Integers.swift.gyb
+  Integers.swift
+  IntegerTypes.swift.gyb
   Join.swift
   KeyPath.swift
-  LazyCollection.swift.gyb
+  KeyValuePairs.swift
+  LazyCollection.swift
   LazySequence.swift
   LifetimeManager.swift
   ManagedBuffer.swift
-  Map.swift.gyb
+  Map.swift
   MemoryLayout.swift
   UnicodeScalar.swift # ORDER DEPENDENCY: Must precede Mirrors.swift
   Mirrors.swift.gyb
   Misc.swift
   MutableCollection.swift
-  NewtypeWrapper.swift.gyb
-  ObjCMirrors.swift
+  NativeDictionary.swift
+  NativeSet.swift
+  NewtypeWrapper.swift
+  NormalizedCodeUnitIterator.swift
   ObjectIdentifier.swift
   Optional.swift
   OptionSet.swift
   OutputStream.swift
   Pointer.swift
   Policy.swift
-  PrefixWhile.swift.gyb
+  PrefixWhile.swift
   Print.swift
+  Random.swift
   RandomAccessCollection.swift
-  Range.swift.gyb
+  Range.swift
   RangeReplaceableCollection.swift
-  ReflectionLegacy.swift
+  ReflectionMirror.swift
   Repeat.swift
   REPL.swift
   Reverse.swift
   Runtime.swift.gyb
   RuntimeFunctionCounters.swift
-  SipHash.swift.gyb
-  SentinelCollection.swift
+  SipHash.swift
   Sequence.swift
-  SequenceAlgorithms.swift.gyb
+  SequenceAlgorithms.swift
   SequenceWrapper.swift
+  Set.swift
   SetAlgebra.swift
+  SetAnyHashableExtensions.swift
+  SetBridging.swift
+  SetBuilder.swift
+  SetCasting.swift
+  SetStorage.swift
+  SetVariant.swift
   ShadowProtocols.swift
   Shims.swift
   Slice.swift
-  Sort.swift.gyb
+  SmallString.swift
+  Sort.swift
   StaticString.swift
-  Stride.swift.gyb
-  StringCharacterView.swift # ORDER DEPENDENCY: Must precede String.swift
+  Stride.swift
   StringHashable.swift  # ORDER DEPENDENCY: Must precede String.swift
   String.swift
   StringBridge.swift
-  StringBuffer.swift
+  StringCharacterView.swift
   StringComparable.swift
-  StringCore.swift
+  StringComparison.swift
+  StringCreate.swift
+  StringGuts.swift
+  StringGutsVisitor.swift
+  StringObject.swift
+  StringProtocol.swift
   StringIndex.swift
+  StringIndexConversions.swift
   StringInterpolation.swift
   StringLegacy.swift
-  StringRangeReplaceableCollection.swift.gyb
+  StringNormalization.swift
+  StringRangeReplaceableCollection.swift
+  StringStorage.swift
   StringSwitch.swift
-  StringIndexConversions.swift
+  StringTesting.swift
   StringUnicodeScalarView.swift
-  StringUTF16.swift
-  StringUTF8.swift
-  Substring.swift.gyb
+  StringUTF16View.swift
+  StringUTF8View.swift
+  StringVariant.swift
+  Substring.swift
   SwiftNativeNSArray.swift
   ThreadLocalStorage.swift
   UIntBuffer.swift
   UnavailableStringAPIs.swift.gyb
   UnicodeEncoding.swift
   UnicodeParser.swift
+  UnicodeScalarProperties.swift
   Unmanaged.swift
-  UnsafeBitMap.swift
+  UnmanagedOpaqueString.swift
+  UnmanagedString.swift
   UnsafeBufferPointer.swift.gyb
   UnsafeRawBufferPointer.swift.gyb
-  UnsafePointer.swift.gyb
-  UnsafeRawPointer.swift.gyb
+  UnsafePointer.swift
+  UnsafeRawPointer.swift
   UTFEncoding.swift
   UTF8.swift
   UTF16.swift
   UTF32.swift
   Unicode.swift # ORDER DEPENDENCY: must follow new unicode support
+  StringGraphemeBreaking.swift # ORDER DEPENDENCY: Must follow UTF16.swift
   ValidUTF8Buffer.swift
   WriteBackMutableSlice.swift
+  MigrationSupport.swift
   )
 
 # The complete list of sources in the core standard library.  Includes
@@ -167,6 +197,7 @@ set(SWIFTLIB_SOURCES
   CollectionOfOne.swift
   ExistentialCollection.swift.gyb
   Mirror.swift
+  PlaygroundDisplay.swift
   CommandLine.swift
   SliceBuffer.swift
   Tuple.swift.gyb
@@ -228,8 +259,9 @@ endif()
 list(APPEND swift_stdlib_compile_flags "-Xllvm" "-sil-inline-generics")
 list(APPEND swift_stdlib_compile_flags "-Xllvm" "-sil-partial-specialization")
 list(APPEND swift_stdlib_compile_flags "-Xfrontend" "-enable-sil-ownership")
-list(APPEND swift_stdlib_compile_flags
-     "-enable-experimental-conditional-conformances")
+if(SWIFT_STDLIB_ENABLE_STDLIBCORE_EXCLUSIVITY_CHECKING)
+  list(APPEND swift_stdlib_compile_flags "-enforce-exclusivity=checked")
+endif()
 
 if(SWIFT_CHECK_ESSENTIAL_STDLIB)
   add_swift_library(swift_stdlib_essential ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_STDLIB IS_STDLIB_CORE
@@ -240,23 +272,30 @@ endif()
 
 set(shared_only_libs)
 if(SWIFT_BUILD_STATIC_STDLIB AND "${SWIFT_HOST_VARIANT_SDK}" STREQUAL "LINUX")
-   list(APPEND shared_only_libs swiftImageInspectionShared)
+   list(APPEND swift_core_private_link_libraries swiftImageInspectionShared)
 endif()
 
-add_swift_library(swiftCore ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_STDLIB IS_STDLIB_CORE
-  ${SWIFTLIB_SOURCES}
-  # The copy_shim_headers target dependency is required to let the
-  # build system know that there's a rule to produce the shims
-  # directory, but is not sufficient to cause the object file to be rebuilt
-  # when the shim header changes.  Therefore, we pass both the target
-  # and the generated directory as dependencies.
-  FILE_DEPENDS
-    copy_shim_headers "${SWIFTLIB_DIR}/shims"
-    ${GROUP_INFO_JSON_FILE}
-  SWIFT_COMPILE_FLAGS ${swift_stdlib_compile_flags}
-  LINK_FLAGS ${swift_core_link_flags}
-  PRIVATE_LINK_LIBRARIES ${swift_core_private_link_libraries}
-  INCORPORATE_OBJECT_LIBRARIES swiftRuntime swiftStdlibStubs
-  INCORPORATE_OBJECT_LIBRARIES_SHARED_ONLY ${shared_only_libs}
-  FRAMEWORK_DEPENDS ${swift_core_framework_depends}
-  INSTALL_IN_COMPONENT stdlib)
+add_swift_library(swiftCore
+                  ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_STDLIB IS_STDLIB_CORE
+                    ${SWIFTLIB_SOURCES}
+                  # The copy_shim_headers target dependency is required to let the
+                  # build system know that there's a rule to produce the shims
+                  # directory, but is not sufficient to cause the object file to be rebuilt
+                  # when the shim header changes.  Therefore, we pass both the target
+                  # and the generated directory as dependencies.
+                  FILE_DEPENDS
+                    copy_shim_headers "${SWIFTLIB_DIR}/shims" ${GROUP_INFO_JSON_FILE}
+                  SWIFT_COMPILE_FLAGS
+                    ${swift_stdlib_compile_flags} -Xcc -DswiftCore_EXPORTS
+                  LINK_FLAGS
+                    ${swift_core_link_flags}
+                  PRIVATE_LINK_LIBRARIES
+                    ${swift_core_private_link_libraries}
+                  INCORPORATE_OBJECT_LIBRARIES
+                    swiftRuntime swiftStdlibStubs
+                  INCORPORATE_OBJECT_LIBRARIES_SHARED_ONLY
+                    ${shared_only_libs}
+                  FRAMEWORK_DEPENDS
+                    ${swift_core_framework_depends}
+                  INSTALL_IN_COMPONENT
+                    stdlib)

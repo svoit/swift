@@ -29,7 +29,6 @@ namespace irgen {
   class IRGenFunction;
   class IRGenModule;
   enum class ValueWitness : unsigned;
-  class StackAddress;
   class WitnessIndex;
 
   /// Return the size of a fixed buffer.
@@ -47,6 +46,15 @@ namespace irgen {
                                                 llvm::Value *table,
                                                 WitnessIndex index);
 
+  /// Given a witness table (protocol or value), load one of the
+  /// witnesses.
+  ///
+  /// The load is marked invariant. This should not be used in contexts where
+  /// the referenced witness table is still undergoing initialization.
+  llvm::Value *emitInvariantLoadOfOpaqueWitness(IRGenFunction &IGF,
+                                                llvm::Value *table,
+                                                llvm::Value *index);
+
   /// Emit a call to do an 'initializeBufferWithCopyOfBuffer' operation.
   llvm::Value *emitInitializeBufferWithCopyOfBufferCall(IRGenFunction &IGF,
                                                         llvm::Value *metadata,
@@ -55,18 +63,6 @@ namespace irgen {
 
   /// Emit a call to do an 'initializeBufferWithCopyOfBuffer' operation.
   llvm::Value *emitInitializeBufferWithCopyOfBufferCall(IRGenFunction &IGF,
-                                                        SILType T,
-                                                        Address destBuffer,
-                                                        Address srcBuffer);
-
-  /// Emit a call to do an 'initializeBufferWithTakeOfBuffer' operation.
-  llvm::Value *emitInitializeBufferWithTakeOfBufferCall(IRGenFunction &IGF,
-                                                        llvm::Value *metadata,
-                                                        Address destBuffer,
-                                                        Address srcBuffer);
-
-  /// Emit a call to do an 'initializeBufferWithTakeOfBuffer' operation.
-  llvm::Value *emitInitializeBufferWithTakeOfBufferCall(IRGenFunction &IGF,
                                                         SILType T,
                                                         Address destBuffer,
                                                         Address srcBuffer);
@@ -207,7 +203,7 @@ namespace irgen {
   /// The type must be dynamically known to have enum witnesses.
   void emitDestructiveInjectEnumTagCall(IRGenFunction &IGF,
                                         SILType T,
-                                        unsigned tag,
+                                        llvm::Value *tag,
                                         Address srcObject);
 
   /// Emit a load of the 'size' value witness.
@@ -234,21 +230,6 @@ namespace irgen {
   /// Emit a load of the 'extraInhabitantCount' value witness.
   /// The type must be dynamically known to have extra inhabitant witnesses.
   llvm::Value *emitLoadOfExtraInhabitantCount(IRGenFunction &IGF, SILType T);
-
-  /// Emit a dynamic alloca call to allocate enough memory to hold an object of
-  /// type 'T' and an optional llvm.stackrestore point if 'isInEntryBlock' is
-  /// false.
-  struct DynamicAlloca {
-    llvm::Value *Alloca;
-    llvm::Value *SavedSP;
-    DynamicAlloca(llvm::Value *A, llvm::Value *SP) : Alloca(A), SavedSP(SP) {}
-  };
-  DynamicAlloca emitDynamicAlloca(IRGenFunction &IGF, SILType T,
-                                  bool isInEntryBlock);
-
-  /// Deallocate dynamic alloca's memory if the stack address has an SP restore
-  /// point associated with it.
-  void emitDeallocateDynamicAlloca(IRGenFunction &IGF, StackAddress address);
 
   /// Returns the IsInline flag and the loaded flags value.
   std::pair<llvm::Value *, llvm::Value *>

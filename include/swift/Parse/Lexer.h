@@ -20,6 +20,7 @@
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/Basic/SourceManager.h"
+#include "swift/Parse/LexerState.h"
 #include "swift/Parse/Token.h"
 #include "swift/Syntax/References.h"
 #include "swift/Syntax/Trivia.h"
@@ -50,6 +51,11 @@ enum class TriviaRetentionMode {
   WithTrivia,
 };
 
+enum class HashbangMode : bool {
+  Disallowed,
+  Allowed,
+};
+
 /// Kinds of conflict marker which the lexer might encounter.
 enum class ConflictMarkerKind {
   /// A normal or diff3 conflict marker, initiated by at least 7 "<"s,
@@ -59,12 +65,14 @@ enum class ConflictMarkerKind {
   /// separated by 4 "="s, and terminated by 4 "<"s.
   Perforce
 };
-  
+
 class Lexer {
   const LangOptions &LangOpts;
   const SourceManager &SourceMgr;
-  DiagnosticEngine *Diags;
   const unsigned BufferID;
+  DiagnosticEngine *Diags;
+
+  using State = LexerState;
 
   /// Pointer to the first character of the buffer, even in a lexer that
   /// scans a subrange of the buffer.
@@ -83,30 +91,20 @@ class Lexer {
   /// produce a code completion token.
   const char *CodeCompletionPtr = nullptr;
 
+  /// Points to BufferStart or past the end of UTF-8 BOM sequence if it exists.
+  const char *ContentStart;
+
   /// Pointer to the next not consumed character.
   const char *CurPtr;
-
-  /// @{
-  /// Members that are *not* permanent lexer state.  The values only make sense
-  /// during the lexImpl() invocation.  These variables are declared as members
-  /// rather than locals so that we don't have to thread them through to all
-  /// lexing helpers.
-
-  /// Points to the point in the source buffer where we started scanning for
-  /// the current token.  Thus, the range [LastCommentBlockStart, CurPtr)
-  /// covers all comments and whitespace that we skipped, and the token itself.
-  const char *LastCommentBlockStart = nullptr;
-
-  /// True if we have seen a comment while scanning for the current token.
-  bool SeenComment = false;
-
-  /// @}
 
   Token NextToken;
   
   /// \brief This is true if we're lexing a .sil file instead of a .swift
   /// file.  This enables the 'sil' keyword.
   const bool InSILMode;
+
+  /// True if we should skip past a `#!` line at the start of the file.
+  const bool IsHashbangAllowed;
 
   const CommentRetentionMode RetainComments;
 
@@ -120,59 +118,29 @@ class Lexer {
   ///
   /// This is only preserved if this Lexer was constructed with
   /// `TriviaRetentionMode::WithTrivia`.
-  syntax::TriviaList LeadingTrivia;
+  syntax::Trivia LeadingTrivia;
 
   /// The current trailing trivia for the next token.
   ///
   /// This is only preserved if this Lexer was constructed with
   /// `TriviaRetentionMode::WithTrivia`.
-  syntax::TriviaList TrailingTrivia;
+  syntax::Trivia TrailingTrivia;
   
-public:
-  /// \brief Lexer state can be saved/restored to/from objects of this class.
-  class State {
-  public:
-    State() {}
-
-    bool isValid() const {
-      return Loc.isValid();
-    }
-
-    State advance(unsigned Offset) const {
-      assert(isValid());
-      return State(Loc.getAdvancedLoc(Offset), LeadingTrivia, TrailingTrivia);
-    }
-
-  private:
-    explicit State(SourceLoc Loc,
-                   syntax::TriviaList LeadingTrivia,
-                   syntax::TriviaList TrailingTrivia)
-      : Loc(Loc), LeadingTrivia(LeadingTrivia),
-        TrailingTrivia(TrailingTrivia) {}
-    SourceLoc Loc;
-    syntax::TriviaList LeadingTrivia;
-    syntax::TriviaList TrailingTrivia;
-    friend class Lexer;
-  };
-
-private:
   Lexer(const Lexer&) = delete;
   void operator=(const Lexer&) = delete;
+
+  struct PrincipalTag {};
 
   /// The principal constructor used by public constructors below.
   /// Don't use this constructor for other purposes, it does not initialize
   /// everything.
-  Lexer(const LangOptions &Options,
-        const SourceManager &SourceMgr, DiagnosticEngine *Diags,
-        unsigned BufferID, bool InSILMode,
+  Lexer(const PrincipalTag &, const LangOptions &LangOpts,
+        const SourceManager &SourceMgr, unsigned BufferID,
+        DiagnosticEngine *Diags, bool InSILMode, HashbangMode HashbangAllowed,
         CommentRetentionMode RetainComments,
         TriviaRetentionMode TriviaRetention);
 
-  /// @{
-  /// Helper routines used in \c Lexer constructors.
-  void primeLexer();
-  void initSubLexer(Lexer &Parent, State BeginState, State EndState);
-  /// @}
+  void initialize(unsigned Offset, unsigned EndOffset);
 
 public:
   /// \brief Create a normal lexer that scans the whole source buffer.
@@ -188,33 +156,19 @@ public:
   ///   means that APIs like getLocForEndOfToken really ought to take
   ///   this flag; it's just that we don't care that much about fidelity
   ///   when parsing SIL files.
-  Lexer(const LangOptions &Options,
-        const SourceManager &SourceMgr, unsigned BufferID,
-        DiagnosticEngine *Diags, bool InSILMode,
-        CommentRetentionMode RetainComments = CommentRetentionMode::None,
-        TriviaRetentionMode TriviaRetention = TriviaRetentionMode::WithoutTrivia)
-      : Lexer(Options, SourceMgr, Diags, BufferID, InSILMode, RetainComments,
-              TriviaRetention) {
-    primeLexer();
-  }
+  Lexer(
+      const LangOptions &Options, const SourceManager &SourceMgr,
+      unsigned BufferID, DiagnosticEngine *Diags, bool InSILMode,
+      HashbangMode HashbangAllowed = HashbangMode::Disallowed,
+      CommentRetentionMode RetainComments = CommentRetentionMode::None,
+      TriviaRetentionMode TriviaRetention = TriviaRetentionMode::WithoutTrivia);
 
   /// \brief Create a lexer that scans a subrange of the source buffer.
-  Lexer(const LangOptions &Options,
-        const SourceManager &SourceMgr, unsigned BufferID,
-        DiagnosticEngine *Diags, bool InSILMode,
-        CommentRetentionMode RetainComments,
-        TriviaRetentionMode TriviaRetention,
-        unsigned Offset, unsigned EndOffset)
-      : Lexer(Options, SourceMgr, Diags, BufferID, InSILMode, RetainComments,
-              TriviaRetention) {
-    assert(Offset <= EndOffset && "invalid range");
-    initSubLexer(
-        *this,
-        State(getLocForStartOfBuffer().getAdvancedLoc(Offset),
-              LeadingTrivia, TrailingTrivia),
-        State(getLocForStartOfBuffer().getAdvancedLoc(EndOffset),
-              LeadingTrivia, TrailingTrivia));
-  }
+  Lexer(const LangOptions &Options, const SourceManager &SourceMgr,
+        unsigned BufferID, DiagnosticEngine *Diags, bool InSILMode,
+        HashbangMode HashbangAllowed, CommentRetentionMode RetainComments,
+        TriviaRetentionMode TriviaRetention, unsigned Offset,
+        unsigned EndOffset);
 
   /// \brief Create a sub-lexer that lexes from the same buffer, but scans
   /// a subrange of the buffer.
@@ -222,12 +176,7 @@ public:
   /// \param Parent the parent lexer that scans the whole buffer
   /// \param BeginState start of the subrange
   /// \param EndState end of the subrange
-  Lexer(Lexer &Parent, State BeginState, State EndState)
-      : Lexer(Parent.LangOpts, Parent.SourceMgr, Parent.Diags, Parent.BufferID,
-              Parent.InSILMode, Parent.RetainComments,
-              Parent.TriviaRetention) {
-    initSubLexer(Parent, BeginState, EndState);
-  }
+  Lexer(Lexer &Parent, State BeginState, State EndState);
 
   /// \brief Returns true if this lexer will produce a code completion token.
   bool isCodeCompletion() const {
@@ -239,18 +188,26 @@ public:
   void lex(Token &Result, syntax::Trivia &LeadingTriviaResult,
            syntax::Trivia &TrailingTriviaResult) {
     Result = NextToken;
-    LeadingTriviaResult = {LeadingTrivia};
-    TrailingTriviaResult = {TrailingTrivia};
-    if (Result.isNot(tok::eof)) {
-      LeadingTrivia.clear();
-      TrailingTrivia.clear();
-      lexImpl();
+    if (TriviaRetention == TriviaRetentionMode::WithTrivia) {
+      LeadingTriviaResult = {LeadingTrivia};
+      TrailingTriviaResult = {TrailingTrivia};
     }
+    if (Result.isNot(tok::eof))
+      lexImpl();
   }
 
   void lex(Token &Result) {
     syntax::Trivia LeadingTrivia, TrailingTrivia;
     lex(Result, LeadingTrivia, TrailingTrivia);
+  }
+
+  /// Reset the lexer's buffer pointer to \p Offset bytes after the buffer
+  /// start.
+  void resetToOffset(size_t Offset) {
+    assert(BufferStart + Offset <= BufferEnd && "Offset after buffer end");
+
+    CurPtr = BufferStart + Offset;
+    lexImpl();
   }
 
   bool isKeepingComments() const {
@@ -271,19 +228,27 @@ public:
   /// \brief Returns the lexer state for the beginning of the given token.
   /// After restoring the state, lexer will return this token and continue from
   /// there.
-  State getStateForBeginningOfToken(const Token &Tok) const {
+  State getStateForBeginningOfToken(const Token &Tok,
+                                    const syntax::Trivia &LeadingTrivia = {}) const {
+
     // If the token has a comment attached to it, rewind to before the comment,
     // not just the start of the token.  This ensures that we will re-lex and
     // reattach the comment to the token if rewound to this state.
     SourceLoc TokStart = Tok.getCommentStart();
     if (TokStart.isInvalid())
       TokStart = Tok.getLoc();
-    return getStateForBeginningOfTokenLoc(TokStart);
+    auto S = getStateForBeginningOfTokenLoc(TokStart);
+    if (TriviaRetention == TriviaRetentionMode::WithTrivia)
+      S.LeadingTrivia = LeadingTrivia;
+    return S;
   }
 
   State getStateForEndOfTokenLoc(SourceLoc Loc) const {
-    return State(getLocForEndOfToken(SourceMgr, Loc), LeadingTrivia,
-                 TrailingTrivia);
+    return State(getLocForEndOfToken(SourceMgr, Loc));
+  }
+
+  bool isStateForCurrentBuffer(LexerState State) const {
+    return SourceMgr.findBufferContainingLoc(State.Loc) == getBufferID();
   }
 
   /// \brief Restore the lexer state to a given one, that can be located either
@@ -291,12 +256,16 @@ public:
   void restoreState(State S, bool enableDiagnostics = false) {
     assert(S.isValid());
     CurPtr = getBufferPtrForSourceLoc(S.Loc);
-    LeadingTrivia = S.LeadingTrivia;
-    TrailingTrivia = S.TrailingTrivia;
     // Don't reemit diagnostics while readvancing the lexer.
     llvm::SaveAndRestore<DiagnosticEngine*>
       D(Diags, enableDiagnostics ? Diags : nullptr);
+
     lexImpl();
+
+    // Restore Trivia.
+    if (TriviaRetention == TriviaRetentionMode::WithTrivia)
+      if (auto &LTrivia = S.LeadingTrivia)
+        LeadingTrivia = std::move(*LTrivia);
   }
 
   /// \brief Restore the lexer state to a given state that is located before
@@ -367,7 +336,11 @@ public:
 
   /// Retrieve the string used to indent the line that contains the given
   /// source location.
-  static StringRef getIndentationForLine(SourceManager &SM, SourceLoc Loc);
+  ///
+  /// If \c ExtraIndentation is not null, it will be set to an appropriate
+  /// additional intendation for adding code in a smaller scope "within" \c Loc.
+  static StringRef getIndentationForLine(SourceManager &SM, SourceLoc Loc,
+                                         StringRef *ExtraIndentation = nullptr);
 
   /// \brief Determines if the given string is a valid non-operator
   /// identifier, without escaping characters.
@@ -391,12 +364,13 @@ public:
     enum : char { Literal, Expr } Kind;
     // Loc+Length for the segment inside the string literal, without quotes.
     SourceLoc Loc;
-    unsigned Length, IndentToStrip;
+    unsigned Length, IndentToStrip, CustomDelimiterLen;
     bool IsFirstSegment, IsLastSegment;
 
     static StringSegment getLiteral(SourceLoc Loc, unsigned Length,
                                     bool IsFirstSegment, bool IsLastSegment,
-                                    unsigned IndentToStrip) {
+                                    unsigned IndentToStrip,
+                                    unsigned CustomDelimiterLen) {
       StringSegment Result;
       Result.Kind = Literal;
       Result.Loc = Loc;
@@ -404,6 +378,7 @@ public:
       Result.IsFirstSegment = IsFirstSegment;
       Result.IsLastSegment = IsLastSegment;
       Result.IndentToStrip = IndentToStrip;
+      Result.CustomDelimiterLen = CustomDelimiterLen;
       return Result;
     }
     
@@ -415,28 +390,59 @@ public:
       Result.IsFirstSegment = false;
       Result.IsLastSegment = false;
       Result.IndentToStrip = 0;
+      Result.CustomDelimiterLen = 0;
       return Result;
     }
 
     SourceLoc getEndLoc() {
       return Loc.getAdvancedLoc(Length);
     }
+
   };
-  
+
+  /// Implementation of getEncodedStringSegment. Note that \p Str must support
+  /// reading one byte past the end.
+  static StringRef getEncodedStringSegmentImpl(StringRef Str,
+                                               SmallVectorImpl<char> &Buffer,
+                                               bool IsFirstSegment,
+                                               bool IsLastSegment,
+                                               unsigned IndentToStrip,
+                                               unsigned CustomDelimiterLen);
+
   /// \brief Compute the bytes that the actual string literal should codegen to.
   /// If a copy needs to be made, it will be allocated out of the provided
-  /// Buffer.
+  /// \p Buffer.
+  StringRef getEncodedStringSegment(StringSegment Segment,
+                                    SmallVectorImpl<char> &Buffer) const {
+    return getEncodedStringSegmentImpl(
+        StringRef(getBufferPtrForSourceLoc(Segment.Loc), Segment.Length),
+        Buffer, Segment.IsFirstSegment, Segment.IsLastSegment,
+        Segment.IndentToStrip, Segment.CustomDelimiterLen);
+  }
+
+  /// \brief Given a string encoded with escapes like a string literal, compute
+  /// the byte content.
+  ///
+  /// If a copy needs to be made, it will be allocated out of the provided
+  /// \p Buffer.
   static StringRef getEncodedStringSegment(StringRef Str,
                                            SmallVectorImpl<char> &Buffer,
                                            bool IsFirstSegment = false,
                                            bool IsLastSegment = false,
-                                           unsigned IndentToStrip = 0);
-  StringRef getEncodedStringSegment(StringSegment Segment,
-                                    SmallVectorImpl<char> &Buffer) const {
-    return getEncodedStringSegment(
-        StringRef(getBufferPtrForSourceLoc(Segment.Loc), Segment.Length),
-        Buffer, Segment.IsFirstSegment, Segment.IsLastSegment,
-        Segment.IndentToStrip);
+                                           unsigned IndentToStrip = 0,
+                                           unsigned CustomDelimiterLen = 0) {
+    SmallString<128> TerminatedStrBuf(Str);
+    TerminatedStrBuf.push_back('\0');
+    StringRef TerminatedStr = StringRef(TerminatedStrBuf).drop_back();
+    StringRef Result = getEncodedStringSegmentImpl(TerminatedStr, Buffer,
+                                                   IsFirstSegment,
+                                                   IsLastSegment,
+                                                   IndentToStrip,
+                                                   CustomDelimiterLen);
+    if (Result == TerminatedStr)
+      return Str;
+    assert(Result.data() == Buffer.data());
+    return Result;
   }
 
   /// \brief Given a string literal token, separate it into string/expr segments
@@ -475,18 +481,20 @@ public:
   };
 
 private:
+  /// Nul character meaning kind.
+  enum class NulCharacterKind {
+    /// String buffer terminator.
+    BufferEnd,
+    /// Embedded nul character.
+    Embedded,
+    /// Code completion marker.
+    CodeCompletion
+  };
+
   /// For a source location in the current buffer, returns the corresponding
   /// pointer.
   const char *getBufferPtrForSourceLoc(SourceLoc Loc) const {
     return BufferStart + SourceMgr.getLocOffsetInBuffer(Loc, BufferID);
-  }
-
-  StringRef getSubstring(const char *Start, unsigned Length) const {
-    assert(Start >= BufferStart && Start <= BufferEnd);
-    unsigned BytesUntilBufferEnd = BufferEnd - Start;
-    if (Length > BytesUntilBufferEnd)
-      Length = BytesUntilBufferEnd;
-    return StringRef(Start, Length);
   }
 
   void lexImpl();
@@ -498,20 +506,21 @@ private:
     return diagnose(Loc, Diagnostic(DiagID, std::forward<ArgTypes>(Args)...));
   }
 
-  void formToken(tok Kind, const char *TokStart, bool MultilineString = false);
+  void formToken(tok Kind, const char *TokStart);
+  void formEscapedIdentifierToken(const char *TokStart);
+  void formStringLiteralToken(const char *TokStart, bool IsMultilineString,
+                              unsigned CustomDelimiterLen);
 
-  /// Advance to the end of the line but leave the current buffer pointer
-  /// at that newline character.
-  void skipUpToEndOfLine();
-
-  /// Advance past the next newline character.
-  void skipToEndOfLine();
+  /// Advance to the end of the line.
+  /// If EatNewLine is true, CurPtr will be at end of newline character.
+  /// Otherwise, CurPtr will be at newline character.
+  void skipToEndOfLine(bool EatNewline);
 
   /// Skip to the end of the line of a // comment.
-  void skipSlashSlashComment();
+  void skipSlashSlashComment(bool EatNewline);
 
   /// Skip a #! hashbang line.
-  void skipHashbang();
+  void skipHashbang(bool EatNewline);
 
   void skipSlashStarComment();
   void lexHash();
@@ -520,26 +529,27 @@ private:
   void lexOperatorIdentifier();
   void lexHexNumber();
   void lexNumber();
-  void lexTrivia(syntax::TriviaList &T, bool StopAtFirstNewline = false);
-  Optional<syntax::TriviaPiece> lexWhitespace(bool StopAtFirstNewline);
-  Optional<syntax::TriviaPiece> lexComment();
-  Optional<syntax::TriviaPiece> lexSingleLineComment(syntax::TriviaKind Kind);
-  Optional<syntax::TriviaPiece> lexBlockComment(syntax::TriviaKind Kind);
-  Optional<syntax::TriviaPiece> lexDocComment();
+  void lexTrivia(syntax::Trivia &T, bool IsForTrailingTrivia);
   static unsigned lexUnicodeEscape(const char *&CurPtr, Lexer *Diags);
 
-  unsigned lexCharacter(const char *&CurPtr,
-                        char StopQuote, bool EmitDiagnostics,
-                        bool MultilineString = false);
-  void lexStringLiteral();
+  unsigned lexCharacter(const char *&CurPtr, char StopQuote,
+                        bool EmitDiagnostics, bool IsMultilineString = false,
+                        unsigned CustomDelimiterLen = 0);
+  void lexStringLiteral(unsigned CustomDelimiterLen = 0);
   void lexEscapedIdentifier();
 
   void tryLexEditorPlaceholder();
-  const char *findEndOfCurlyQuoteStringLiteral(const char*);
+  const char *findEndOfCurlyQuoteStringLiteral(const char *,
+                                               bool EmitDiagnostics);
 
   /// Try to lex conflict markers by checking for the presence of the start and
   /// end of the marker in diff3 or Perforce style respectively.
-  bool tryLexConflictMarker();
+  bool tryLexConflictMarker(bool EatNewline);
+
+  /// Returns it should be tokenize.
+  bool lexUnknown(bool EmitDiagnosticsIfToken);
+
+  NulCharacterKind getNulCharacterKind(const char *Ptr) const;
 };
   
 /// Given an ordered token \param Array , get the iterator pointing to the first

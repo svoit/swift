@@ -99,10 +99,11 @@ static const char *skipStringInCode(const char *p, const char *End) {
 }
 
 SourceCompleteResult
-ide::isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf) {
+ide::isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf,
+                           SourceFileKind SFKind) {
   SourceManager SM;
   auto BufferID = SM.addNewSourceBuffer(std::move(MemBuf));
-  ParserUnit Parse(SM, BufferID);
+  ParserUnit Parse(SM, SFKind, BufferID);
   Parser &P = Parse.getParser();
 
   bool Done;
@@ -187,8 +188,10 @@ ide::isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf) {
   return SCR;
 }
 
-SourceCompleteResult ide::isSourceInputComplete(StringRef Text) {
-  return ide::isSourceInputComplete(llvm::MemoryBuffer::getMemBufferCopy(Text));
+SourceCompleteResult
+ide::isSourceInputComplete(StringRef Text,SourceFileKind SFKind) {
+  return ide::isSourceInputComplete(llvm::MemoryBuffer::getMemBufferCopy(Text),
+                                    SFKind);
 }
 
 // Adjust the cc1 triple string we got from clang, to make sure it will be
@@ -375,7 +378,7 @@ static void walkOverriddenClangDecls(const clang::NamedDecl *D, const FnTy &Fn){
 
 void
 ide::walkOverriddenDecls(const ValueDecl *VD,
-                         std::function<void(llvm::PointerUnion<
+                         llvm::function_ref<void(llvm::PointerUnion<
                              const ValueDecl*, const clang::NamedDecl*>)> Fn) {
   for (auto CurrOver = VD; CurrOver; CurrOver = CurrOver->getOverriddenDecl()) {
     if (CurrOver != VD)
@@ -904,8 +907,7 @@ public:
   }
 
   void replaceText(SourceManager &SM, CharSourceRange Range, StringRef Text) {
-    auto BufferId = SM.getIDForBufferIdentifier(SM.
-      getBufferIdentifierForLoc(Range.getStart())).getValue();
+    auto BufferId = SM.findBufferContainingLoc(Range.getStart());
     if (BufferId == InterestedId) {
       HasChange = true;
       auto StartLoc = SM.getLocOffsetInBuffer(Range.getStart(), BufferId);
@@ -940,6 +942,10 @@ swift::ide::SourceEditOutputConsumer::~SourceEditOutputConsumer() { delete &Impl
 void swift::ide::SourceEditOutputConsumer::
 accept(SourceManager &SM, RegionType RegionType,
        ArrayRef<Replacement> Replacements) {
+  // ignore mismatched or
+  if (RegionType == RegionType::Unmatched || RegionType == RegionType::Mismatch)
+    return;
+
   for (const auto &Replacement : Replacements) {
     Impl.accept(SM, Replacement.Range, Replacement.Text);
   }

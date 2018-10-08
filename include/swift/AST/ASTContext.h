@@ -19,9 +19,9 @@
 
 #include "llvm/Support/DataTypes.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/Evaluator.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/SearchPathOptions.h"
-#include "swift/AST/SubstitutionList.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeAlignments.h"
 #include "swift/Basic/LangOptions.h"
@@ -65,6 +65,7 @@ namespace swift {
   class LazyGenericContextData;
   class LazyIterableDeclContextData;
   class LazyMemberLoader;
+  class LazyMemberParser;
   class LazyResolver;
   class PatternBindingDecl;
   class PatternBindingInitializer;
@@ -90,13 +91,11 @@ namespace swift {
   class PrecedenceGroupDecl;
   class TupleTypeElt;
   class EnumElementDecl;
-  enum OptionalTypeKind : unsigned;
   class ProtocolDecl;
   class SubstitutableType;
   class SourceManager;
   class ValueDecl;
   class DiagnosticEngine;
-  class Substitution;
   class TypeCheckerDebugConsumer;
   struct RawComment;
   class DocComment;
@@ -106,6 +105,10 @@ namespace swift {
   class UnifiedStatsReporter;
 
   enum class KnownProtocolKind : uint8_t;
+
+namespace syntax {
+  class SyntaxArena;
+}
 
 /// \brief The arena in which a particular ASTContext allocation will go.
 enum class AllocationArena {
@@ -170,10 +173,6 @@ public:
 };
 
 class SILLayout; // From SIL
-/// \brief Describes either a nominal type declaration or an extension
-/// declaration.
-typedef llvm::PointerUnion<NominalTypeDecl *, ExtensionDecl *>
-  TypeOrExtensionDecl;
 
 /// ASTContext - This object creates and owns the AST objects.
 /// However, this class does more than just maintain context within an AST.
@@ -187,20 +186,33 @@ typedef llvm::PointerUnion<NominalTypeDecl *, ExtensionDecl *>
 /// DispatchQueues. Summary: if you think you need a global or static variable,
 /// you probably need to put it here instead.
 
-class ASTContext {
+class ASTContext final {
   ASTContext(const ASTContext&) = delete;
   void operator=(const ASTContext&) = delete;
+
+  ASTContext(LangOptions &langOpts, SearchPathOptions &SearchPathOpts,
+             SourceManager &SourceMgr, DiagnosticEngine &Diags);
 
 public:
   // Members that should only be used by ASTContext.cpp.
   struct Implementation;
-  Implementation &Impl;
-  
+  Implementation &getImpl() const;
+
   friend ConstraintCheckerArenaRAII;
-public:
-  ASTContext(LangOptions &langOpts, SearchPathOptions &SearchPathOpts,
-             SourceManager &SourceMgr, DiagnosticEngine &Diags);
+
+  void operator delete(void *Data) throw();
+
+  static ASTContext *get(LangOptions &langOpts,
+                         SearchPathOptions &SearchPathOpts,
+                         SourceManager &SourceMgr,
+                         DiagnosticEngine &Diags);
   ~ASTContext();
+
+  /// Optional table of counters to report, nullptr when not collecting.
+  ///
+  /// This must be initialized early so that Allocate() doesn't try to access
+  /// it before being set to null.
+  UnifiedStatsReporter *Stats = nullptr;
 
   /// \brief The language options used for translation.
   LangOptions &LangOpts;
@@ -213,6 +225,9 @@ public:
 
   /// Diags - The diagnostics engine.
   DiagnosticEngine &Diags;
+
+  /// The request-evaluator that is used to process various requests.
+  Evaluator evaluator;
 
   /// The set of top-level modules we have loaded.
   /// This map is used for iteration, therefore it's a MapVector and not a
@@ -252,9 +267,6 @@ public:
   /// Cache of remapped types (useful for diagnostics).
   llvm::StringMap<Type> RemappedTypes;
 
-  /// Optional table of counters to report, nullptr when not collecting.
-  UnifiedStatsReporter *Stats = nullptr;
-
 private:
   /// \brief The current generation number, which reflects the number of
   /// times that external modules have been loaded.
@@ -275,11 +287,11 @@ private:
   /// Cache of module names that fail the 'canImport' test in this context.
   llvm::SmallPtrSet<Identifier, 8> FailedModuleImportNames;
   
-public:
   /// \brief Retrieve the allocator for the given arena.
   llvm::BumpPtrAllocator &
   getAllocator(AllocationArena arena = AllocationArena::Permanent) const;
 
+public:
   /// Allocate - Allocate memory from the ASTContext bump pointer.
   void *Allocate(unsigned long bytes, unsigned alignment,
                  AllocationArena arena = AllocationArena::Permanent) const {
@@ -288,7 +300,9 @@ public:
 
     if (LangOpts.UseMalloc)
       return AlignedAlloc(bytes, alignment);
-    
+
+    if (arena == AllocationArena::Permanent && Stats)
+      Stats->getFrontendCounters().NumASTBytesAllocated += bytes;
     return getAllocator(arena).Allocate(bytes, alignment);
   }
 
@@ -380,11 +394,23 @@ public:
                               setVector.size());
   }
 
+  /// Retrive the syntax node memory manager for this context.
+  llvm::IntrusiveRefCntPtr<syntax::SyntaxArena> getSyntaxArena() const;
+
+  /// Set a new stats reporter.
+  void setStatsReporter(UnifiedStatsReporter *stats);
+
   /// Retrieve the lazy resolver for this context.
   LazyResolver *getLazyResolver() const;
 
   /// Set the lazy resolver for this context.
   void setLazyResolver(LazyResolver *resolver);
+
+  /// Add a lazy parser for resolving members later.
+  void addLazyParser(LazyMemberParser *parser);
+
+  /// Remove a lazy parser.
+  void removeLazyParser(LazyMemberParser *parser);
 
   /// getIdentifier - Return the uniqued and AST-Context-owned version of the
   /// specified string.
@@ -403,23 +429,11 @@ public:
   DECL_CLASS *get##NAME##Decl() const;
 #include "swift/AST/KnownStdlibTypes.def"
 
-  /// Retrieve the declaration of Swift.Optional or ImplicitlyUnwrappedOptional.
-  EnumDecl *getOptionalDecl(OptionalTypeKind kind) const;
-
   /// Retrieve the declaration of Swift.Optional<T>.Some.
   EnumElementDecl *getOptionalSomeDecl() const;
   
   /// Retrieve the declaration of Swift.Optional<T>.None.
   EnumElementDecl *getOptionalNoneDecl() const;
-
-  /// Retrieve the declaration of Swift.ImplicitlyUnwrappedOptional<T>.Some.
-  EnumElementDecl *getImplicitlyUnwrappedOptionalSomeDecl() const;
-
-  /// Retrieve the declaration of Swift.ImplicitlyUnwrappedOptional<T>.None.
-  EnumElementDecl *getImplicitlyUnwrappedOptionalNoneDecl() const;
-
-  EnumElementDecl *getOptionalSomeDecl(OptionalTypeKind kind) const;
-  EnumElementDecl *getOptionalNoneDecl(OptionalTypeKind kind) const;
 
   /// Retrieve the declaration of the "pointee" property of a pointer type.
   VarDecl *getPointerPointeePropertyDecl(PointerTypeKind ptrKind) const;
@@ -481,12 +495,8 @@ public:
   /// Retrieve the declaration of Swift.==(Int, Int) -> Bool.
   FuncDecl *getEqualIntDecl() const;
 
-  /// Retrieve the declaration of
-  /// Swift._mixForSynthesizedHashValue (Int, Int) -> Int.
-  FuncDecl *getMixForSynthesizedHashValueDecl() const;
-
-  /// Retrieve the declaration of Swift._mixInt(Int) -> Int.
-  FuncDecl *getMixIntDecl() const;
+  /// Retrieve the declaration of Swift._hashValue<H>(for: H) -> Int.
+  FuncDecl *getHashValueForDecl() const;
 
   /// Retrieve the declaration of Array.append(element:)
   FuncDecl *getArrayAppendElementDecl() const;
@@ -542,6 +552,11 @@ public:
   /// as part of the current module or source file, but are otherwise not
   /// nested within it.
   void addExternalDecl(Decl *decl);
+
+  /// Add a declaration that was synthesized to a per-source file list if
+  /// if is part of a source file, or the external declarations list if
+  /// it is part of an imported type context.
+  void addSynthesizedDecl(Decl *decl);
 
   /// Add a cleanup function to be called when the ASTContext is deallocated.
   void addCleanup(std::function<void(void)> cleanup);
@@ -749,30 +764,11 @@ public:
   /// \param generic The generic conformance.
   ///
   /// \param substitutions The set of substitutions required to produce the
-  /// specialized conformance from the generic conformance. This list is
-  /// copied so passing a temporary is permitted.
+  /// specialized conformance from the generic conformance.
   ProtocolConformance *
   getSpecializedConformance(Type type,
                             ProtocolConformance *generic,
-                            SubstitutionList substitutions,
-                            bool alreadyCheckedCollapsed = false);
-
-  /// \brief Produce a specialized conformance, which takes a generic
-  /// conformance and substitutions written in terms of the generic
-  /// conformance's signature.
-  ///
-  /// \param type The type for which we are retrieving the conformance.
-  ///
-  /// \param generic The generic conformance.
-  ///
-  /// \param substitutions The set of substitutions required to produce the
-  /// specialized conformance from the generic conformance. The keys must
-  /// be generic parameters, not archetypes, so for example passing in
-  /// TypeBase::getContextSubstitutionMap() is OK.
-  ProtocolConformance *
-  getSpecializedConformance(Type type,
-                            ProtocolConformance *generic,
-                            const SubstitutionMap &substitutions);
+                            SubstitutionMap substitutions);
 
   /// \brief Produce an inherited conformance, for subclasses of a type
   /// that already conforms to a protocol.
@@ -793,6 +789,16 @@ public:
   /// across all calls for the same \p func.
   LazyContextData *getOrCreateLazyContextData(const DeclContext *decl,
                                               LazyMemberLoader *lazyLoader);
+
+  /// Use the lazy parsers associated with the context to populate the members
+  /// of the given decl context.
+  ///
+  /// \param IDC The context whose member decls should be lazily parsed.
+  void parseMembers(IterableDeclContext *IDC);
+
+  /// Use the lazy parsers associated with the context to check whether the decl
+  /// context has been parsed.
+  bool hasUnparsedMembers(const IterableDeclContext *IDC) const;
 
   /// Get the lazy function data for the given generic context.
   ///
@@ -903,8 +909,8 @@ public:
   /// This is usually the check you want; for example, when introducing
   /// a new language feature which is only visible in Swift 5, you would
   /// check for isSwiftVersionAtLeast(5).
-  bool isSwiftVersionAtLeast(unsigned major) const {
-    return LangOpts.isSwiftVersionAtLeast(major);
+  bool isSwiftVersionAtLeast(unsigned major, unsigned minor = 0) const {
+    return LangOpts.isSwiftVersionAtLeast(major, minor);
   }
 
 private:

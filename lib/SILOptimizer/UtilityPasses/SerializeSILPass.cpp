@@ -24,7 +24,15 @@ class SerializeSILPass : public SILModuleTransform {
   /// optimizations and for a better dead function elimination.
   void removeSerializedFlagFromAllFunctions(SILModule &M) {
     for (auto &F : M) {
-      F.setSerialized(IsSerialized_t::IsNotSerialized);
+      F.setSerialized(IsNotSerialized);
+    }
+
+    for (auto &WT : M.getWitnessTables()) {
+      WT.setSerialized(IsNotSerialized);
+    }
+
+    for (auto &VT : M.getVTables()) {
+      VT.setSerialized(IsNotSerialized);
     }
   }
 
@@ -42,7 +50,7 @@ public:
     // serialized functions or anything referenced from them. Therefore,
     // to avoid linker errors, the object file of the current module should
     // contain all the symbols which were alive at the time of serialization.
-    DEBUG(llvm::dbgs() << "Serializing SILModule in SerializeSILPass\n");
+    LLVM_DEBUG(llvm::dbgs() << "Serializing SILModule in SerializeSILPass\n");
     getModule()->serialize();
     removeSerializedFlagFromAllFunctions(M);
   }

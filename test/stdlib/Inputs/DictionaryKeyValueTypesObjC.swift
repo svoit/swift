@@ -20,12 +20,7 @@ public func convertNSDictionaryToDictionary<
 
 func isNativeDictionary<KeyTy : Hashable, ValueTy>(
   _ d: Dictionary<KeyTy, ValueTy>) -> Bool {
-  switch d._variantBuffer {
-  case .native:
-    return true
-  case .cocoa:
-    return false
-  }
+  return d._variant.isNative
 }
 
 func isCocoaDictionary<KeyTy : Hashable, ValueTy>(
@@ -35,7 +30,10 @@ func isCocoaDictionary<KeyTy : Hashable, ValueTy>(
 
 func isNativeNSDictionary(_ d: NSDictionary) -> Bool {
   let className: NSString = NSStringFromClass(type(of: d)) as NSString
-  return ["_SwiftDeferredNSDictionary", "NativeDictionaryStorage"].contains {
+  return [
+    "_SwiftDeferredNSDictionary",
+    "_EmptyDictionarySingleton",
+    "_DictionaryStorage"].contains {
     className.range(of: $0).length > 0
   }
 }
@@ -48,7 +46,7 @@ func isCocoaNSDictionary(_ d: NSDictionary) -> Bool {
 
 func isNativeNSArray(_ d: NSArray) -> Bool {
   let className: NSString = NSStringFromClass(type(of: d)) as NSString
-  return ["_SwiftDeferredNSArray", "_ContiguousArray", "_EmptyArray"].contains {
+  return ["__SwiftDeferredNSArray", "_ContiguousArray", "_EmptyArray"].contains {
     className.range(of: $0).length > 0
   }
 }
@@ -475,8 +473,7 @@ func getBridgedNSDictionaryOfRefTypesBridgedVerbatim() -> NSDictionary {
   d[TestObjCKeyTy(20)] = TestObjCValueTy(1020)
   d[TestObjCKeyTy(30)] = TestObjCValueTy(1030)
 
-  let bridged =
-    unsafeBitCast(convertDictionaryToNSDictionary(d), to: NSDictionary.self)
+  let bridged = convertDictionaryToNSDictionary(d)
 
   assert(isNativeNSDictionary(bridged))
 
@@ -486,8 +483,7 @@ func getBridgedNSDictionaryOfRefTypesBridgedVerbatim() -> NSDictionary {
 func getBridgedEmptyNSDictionary() -> NSDictionary {
   let d = Dictionary<TestObjCKeyTy, TestObjCValueTy>()
 
-  let bridged =
-    unsafeBitCast(convertDictionaryToNSDictionary(d), to: NSDictionary.self)
+  let bridged = convertDictionaryToNSDictionary(d)
   assert(isNativeNSDictionary(bridged))
 
   return bridged
@@ -874,7 +870,7 @@ typealias AnyObjectTuple2 = (AnyObject, AnyObject)
   for i in 0..<3 {
     var actualContents = [ExpectedDictionaryElement]()
     let sink: (AnyObjectTuple2) -> Void = {
-      (key, value) in
+      let (key, value) = $0
       actualContents.append(ExpectedDictionaryElement(
         key: convertKey(key),
         value: convertValue(value),

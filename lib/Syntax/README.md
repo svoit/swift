@@ -425,10 +425,10 @@ auto Integer = SyntaxFactory::makeIntegerLiteralExpr(IntegerTok);
 auto ReturnKW = SyntaxFactory::makeReturnKeyword({}, Trivia::spaces(1));
 
 // This ReturnStmtSyntax is floating, with no root.
-auto Return = SyntaxFactory::makeReturnStmt(ReturnKW, Integer, 
+auto Return = SyntaxFactory::makeReturnStmt(ReturnKW, Integer,
                                             /*Semicolon=*/ None);
 
-auto RightBrace = SyntaxFactory::makeLeftBraceToken({}, {});
+auto RightBrace = SyntaxFactory::makeRightBraceToken({}, {});
 
 auto Statements = SyntaxFactory::makeBlankStmtList()
   .addStmt(Return);
@@ -466,7 +466,7 @@ Legend:
 
 A couple of interesting points and reminders:
 - All strong references point downward in the tree.
-- One `SyntaxData` for each `RawSyntax`.  
+- One `SyntaxData` for each `RawSyntax`.
   Remember, a `SyntaxData` is essentially a `RawSyntax` with a parent pointer
   and cached `SyntaxData` children.
 - Parent pointers are omitted here but there are weak references pointing
@@ -523,21 +523,18 @@ declarations. The `Token` class has the following fields.
 
 libSyntax uses Swift's `gyb` tool to generate the `Syntax` subclasses,
 `SyntaxFactory` methods, `SyntaxKind` enum entry, and `SyntaxBuilder` class.
-These files rely on a support library located at `utils/gyb_syntax_support.py`
+These files rely on a support library located at `utils/gyb_syntax_support/`
 which holds some common logic used inside the `gyb` files. These `gyb` files
 will be re-generated whenever any Python files are changed.
 
 ## Adding new Syntax Nodes
 
 Here's a handy checklist when implementing a production in the grammar.
-- Check that the corresponding `lib/AST` node has `SourceLocs` for all terms. If
-  it doesn't, [file a Swift bug][NewSwiftBug] and fix that first.
-  - **Add the `Syntax` bug label!**
 - Check if it's not already being worked on, and then
-  [file a Swift bug][NewSwiftBug], noting which grammar productions
-  are affected.
+  [file a Swift bug](https://bugs.swift.org/secure/CreateIssue!default.jspa),
+  noting which grammar productions are affected.
   - **Add the `Syntax` bug label!**
-- Create the `${KIND}` entry in the appropriate Python file (Expr, Stmt, 
+- Create the `${KIND}` entry in the appropriate Python file (Expr, Stmt,
   Pattern, etc.).
   - Add C++ unit tests for `with` APIs for all layout elements
       (e.g. `withLeftTypeIdentifier(...)`).
@@ -558,4 +555,5 @@ Here's a handy checklist when implementing a production in the grammar.
     - check for a zero-diff print with `-round-trip-parse`
 - Update `lib/Syntax/Status.md` if applicable.
 
-[NewSwiftBug]: https://bugs.swift.org/secure/CreateIssue!default.jspa)
+## Use libSyntax from Swift code
+SwiftSyntax has been moved to [its own repository](https://github.com/apple/swift-syntax) as a SwiftPM package. Please follow the instructions in that repository for how to use it for a Swift tool.

@@ -14,6 +14,7 @@
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/Basic/NullablePtr.h"
+#include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/Projection.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBasicBlock.h"
@@ -33,6 +34,9 @@ SILValue swift::getUnderlyingObject(SILValue V) {
   }
 }
 
+/// Strip off casts and address projections into the interior of a value. Unlike
+/// getUnderlyingObject, this does not find the root of a heap object--a class
+/// property is itself an address root.
 SILValue swift::getUnderlyingAddressRoot(SILValue V) {
   while (true) {
     SILValue V2 = stripIndexingInsts(stripCasts(V));
@@ -178,24 +182,24 @@ SILValue swift::stripClassCasts(SILValue V) {
   }
 }
 
+SILValue swift::stripAddressAccess(SILValue V) {
+  while (true) {
+    switch (V->getKind()) {
+    default:
+      return V;
+    case ValueKind::BeginBorrowInst:
+    case ValueKind::BeginAccessInst:
+      V = cast<SingleValueInstruction>(V)->getOperand(0);
+    }
+  }
+}
+
 SILValue swift::stripAddressProjections(SILValue V) {
   while (true) {
     V = stripSinglePredecessorArgs(V);
     if (!Projection::isAddressProjection(V))
       return V;
     V = cast<SingleValueInstruction>(V)->getOperand(0);
-  }
-}
-
-SILValue swift::stripUnaryAddressProjections(SILValue V) {
-  while (true) {
-    V = stripSinglePredecessorArgs(V);
-    if (!Projection::isAddressProjection(V))
-      return V;
-    auto *Inst = cast<SingleValueInstruction>(V);
-    if (Inst->getNumOperands() > 1)
-      return V;
-    V = Inst->getOperand(0);
   }
 }
 
@@ -231,6 +235,254 @@ SILValue swift::stripBorrow(SILValue V) {
   return V;
 }
 
+// All instructions handled here must propagate their first operand into their
+// single result.
+//
+// This is guaranteed to handle all function-type converstions: ThinToThick,
+// ConvertFunction, and ConvertEscapeToNoEscapeInst.
+SingleValueInstruction *swift::getSingleValueCopyOrCast(SILInstruction *I) {
+  if (auto *convert = dyn_cast<ConversionInst>(I))
+    return convert;
+
+  switch (I->getKind()) {
+  default:
+    return nullptr;
+  case SILInstructionKind::CopyValueInst:
+  case SILInstructionKind::CopyBlockInst:
+  case SILInstructionKind::CopyBlockWithoutEscapingInst:
+  case SILInstructionKind::BeginBorrowInst:
+  case SILInstructionKind::BeginAccessInst:
+  case SILInstructionKind::MarkDependenceInst:
+    return cast<SingleValueInstruction>(I);
+  }
+}
+
+// Does this instruction terminate a SIL-level scope?
+bool swift::isEndOfScopeMarker(SILInstruction *user) {
+  switch (user->getKind()) {
+  default:
+    return false;
+  case SILInstructionKind::EndAccessInst:
+  case SILInstructionKind::EndBorrowInst:
+  case SILInstructionKind::EndLifetimeInst:
+    return true;
+  }
+}
+
+bool swift::isIncidentalUse(SILInstruction *user) {
+  return isEndOfScopeMarker(user) || user->isDebugInstruction() ||
+         isa<FixLifetimeInst>(user);
+}
+
+bool swift::onlyAffectsRefCount(SILInstruction *user) {
+  switch (user->getKind()) {
+  default:
+    return false;
+  case SILInstructionKind::AutoreleaseValueInst:
+  case SILInstructionKind::DestroyValueInst:
+  case SILInstructionKind::ReleaseValueInst:
+  case SILInstructionKind::RetainValueInst:
+  case SILInstructionKind::StrongReleaseInst:
+  case SILInstructionKind::StrongRetainInst:
+  case SILInstructionKind::UnmanagedAutoreleaseValueInst:
+  case SILInstructionKind::UnmanagedReleaseValueInst:
+  case SILInstructionKind::UnmanagedRetainValueInst:
+#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+  case SILInstructionKind::Name##RetainInst: \
+  case SILInstructionKind::Name##ReleaseInst: \
+  case SILInstructionKind::StrongRetain##Name##Inst:
+#include "swift/AST/ReferenceStorage.def"
+    return true;
+  }
+}
+
+bool swift::isSanitizerInstrumentation(SILInstruction *Instruction) {
+  auto *BI = dyn_cast<BuiltinInst>(Instruction);
+  if (!BI)
+    return false;
+
+  Identifier Name = BI->getName();
+  if (Name == BI->getModule().getASTContext().getIdentifier("tsanInoutAccess"))
+    return true;
+
+  return false;
+}
+
+SILValue swift::stripConvertFunctions(SILValue V) {
+  while (true) {
+    if (auto CFI = dyn_cast<ConvertFunctionInst>(V)) {
+      V = CFI->getOperand();
+      continue;
+    }
+    else if (auto *Cvt = dyn_cast<ConvertEscapeToNoEscapeInst>(V)) {
+      V = Cvt->getOperand();
+      continue;
+    }
+    break;
+  }
+  return V;
+}
+
+
+SILValue swift::isPartialApplyOfReabstractionThunk(PartialApplyInst *PAI) {
+  if (PAI->getNumArguments() != 1)
+    return SILValue();
+
+  auto *Fun = PAI->getReferencedFunction();
+  if (!Fun)
+    return SILValue();
+
+  // Make sure we have a reabstraction thunk.
+  if (Fun->isThunk() != IsReabstractionThunk)
+    return SILValue();
+
+  // The argument should be a closure.
+  auto Arg = PAI->getArgument(0);
+  if (!Arg->getType().is<SILFunctionType>() ||
+      (!Arg->getType().isReferenceCounted(PAI->getFunction()->getModule()) &&
+       Arg->getType().getAs<SILFunctionType>()->getRepresentation() !=
+           SILFunctionType::Representation::Thick))
+    return SILValue();
+
+  return Arg;
+}
+
+/// Given a block used as a noescape function argument, attempt to find all
+/// Swift closures that invoking the block will call. The StoredClosures may not
+/// actually be partial_apply instructions. They may be copied, block arguments,
+/// or conversions. The caller must continue searching up the use-def chain.
+static SILValue findClosureStoredIntoBlock(SILValue V) {
+
+  auto FnType = V->getType().castTo<SILFunctionType>();
+  assert(FnType->getRepresentation() == SILFunctionTypeRepresentation::Block);
+  (void)FnType;
+
+  // Given a no escape block argument to a function,
+  // pattern match to find the noescape closure that invoking the block
+  // will call:
+  //     %noescape_closure = ...
+  //     %wae_Thunk = function_ref @$withoutActuallyEscapingThunk
+  //     %sentinel =
+  //       partial_apply [callee_guaranteed] %wae_thunk(%noescape_closure)
+  //     %noescaped_wrapped = mark_dependence %sentinel on %noescape_closure
+  //     %storage = alloc_stack
+  //     %storage_address = project_block_storage %storage
+  //     store %noescaped_wrapped to [init] %storage_address
+  //     %block = init_block_storage_header %storage invoke %thunk
+  //     %arg = copy_block %block
+
+  InitBlockStorageHeaderInst *IBSHI = dyn_cast<InitBlockStorageHeaderInst>(V);
+  if (!IBSHI)
+    return nullptr;
+
+  SILValue BlockStorage = IBSHI->getBlockStorage();
+  auto *PBSI = BlockStorage->getSingleUserOfType<ProjectBlockStorageInst>();
+  assert(PBSI && "Couldn't find block storage projection");
+
+  auto *SI = PBSI->getSingleUserOfType<StoreInst>();
+  assert(SI && "Couldn't find single store of function into block storage");
+
+  auto *CV = dyn_cast<CopyValueInst>(SI->getSrc());
+  if (!CV)
+    return nullptr;
+  auto *WrappedNoEscape = dyn_cast<MarkDependenceInst>(CV->getOperand());
+  if (!WrappedNoEscape)
+    return nullptr;
+  auto Sentinel = dyn_cast<PartialApplyInst>(WrappedNoEscape->getValue());
+  if (!Sentinel)
+    return nullptr;
+  auto NoEscapeClosure = isPartialApplyOfReabstractionThunk(Sentinel);
+  if (WrappedNoEscape->getBase() != NoEscapeClosure)
+    return nullptr;
+
+  // This is the value of the closure to be invoked. To find the partial_apply
+  // itself, the caller must search the use-def chain.
+  return NoEscapeClosure;
+}
+
+/// Find all closures that may be propagated into the given function-type value.
+///
+/// Searches the use-def chain from the given value upward until a partial_apply
+/// is reached. Populates `results` with the set of partial_apply instructions.
+///
+/// `funcVal` may be either a function type or an Optional function type. This
+/// might be called on a directly applied value or on a call argument, which may
+/// in turn be applied within the callee.
+void swift::findClosuresForFunctionValue(
+    SILValue funcVal, TinyPtrVector<PartialApplyInst *> &results) {
+
+  SILType funcTy = funcVal->getType();
+  // Handle `Optional<@convention(block) @noescape (_)->(_)>`
+  if (auto optionalObjTy = funcTy.getOptionalObjectType())
+    funcTy = optionalObjTy;
+  assert(funcTy.is<SILFunctionType>());
+
+  SmallVector<SILValue, 4> worklist;
+  // Avoid exponential path exploration and prevent duplicate results.
+  llvm::SmallDenseSet<SILValue, 8> visited;
+  auto worklistInsert = [&](SILValue V) {
+    if (visited.insert(V).second)
+      worklist.push_back(V);
+  };
+  worklistInsert(funcVal);
+
+  while (!worklist.empty()) {
+    SILValue V = worklist.pop_back_val();
+
+    if (auto *I = V->getDefiningInstruction()) {
+      // Look through copies, borrows, and conversions.
+      //
+      // Handle copy_block and copy_block_without_actually_escaping before
+      // calling findClosureStoredIntoBlock.
+      if (SingleValueInstruction *SVI = getSingleValueCopyOrCast(I)) {
+        worklistInsert(SVI->getOperand(0));
+        continue;
+      }
+    }
+    // Look through Optionals.
+    if (V->getType().getOptionalObjectType()) {
+      auto *EI = dyn_cast<EnumInst>(V);
+      if (EI && EI->hasOperand()) {
+        worklistInsert(EI->getOperand());
+      }
+      // Ignore the .None case.
+      continue;
+    }
+    // Look through Phis.
+    //
+    // This should be done before calling findClosureStoredIntoBlock.
+    if (auto *arg = dyn_cast<SILPhiArgument>(V)) {
+      SmallVector<std::pair<SILBasicBlock *, SILValue>, 2> blockArgs;
+      arg->getIncomingPhiValues(blockArgs);
+      for (auto &blockAndArg : blockArgs)
+        worklistInsert(blockAndArg.second);
+
+      continue;
+    }
+    // Look through ObjC closures.
+    auto fnType = V->getType().getAs<SILFunctionType>();
+    if (fnType
+        && fnType->getRepresentation() == SILFunctionTypeRepresentation::Block) {
+      if (SILValue storedClosure = findClosureStoredIntoBlock(V))
+        worklistInsert(storedClosure);
+
+      continue;
+    }
+    if (auto *PAI = dyn_cast<PartialApplyInst>(V)) {
+      SILValue thunkArg = isPartialApplyOfReabstractionThunk(PAI);
+      if (thunkArg) {
+        // Handle reabstraction thunks recursively. This may reabstract over
+        // @convention(block).
+        worklistInsert(thunkArg);
+        continue;
+      }
+      results.push_back(PAI);
+      continue;
+    }
+    // Ignore other unrecognized values that feed this applied argument.
+  }
+}
+
 namespace {
 
 enum class OwnershipQualifiedKind {
@@ -252,8 +504,10 @@ struct OwnershipQualifiedKindVisitor : SILInstructionVisitor<OwnershipQualifiedK
   QUALIFIED_INST(EndBorrowInst)
   QUALIFIED_INST(LoadBorrowInst)
   QUALIFIED_INST(CopyValueInst)
-  QUALIFIED_INST(CopyUnownedValueInst)
   QUALIFIED_INST(DestroyValueInst)
+#define SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+  QUALIFIED_INST(Copy##Name##ValueInst)
+#include "swift/AST/ReferenceStorage.def"
 #undef QUALIFIED_INST
 
   OwnershipQualifiedKind visitLoadInst(LoadInst *LI) {

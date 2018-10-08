@@ -18,11 +18,20 @@ func useDict<K, V>(_ d: Dictionary<K,V>) {}
 // Concrete dictionary literals.
 useDictStringInt(["Hello" : 1])
 useDictStringInt(["Hello" : 1, "World" : 2])
-useDictStringInt(["Hello" : 1, "World" : 2.5]) // expected-error{{cannot convert value of type 'Double' to expected dictionary value type 'Int'}}
-useDictStringInt([4.5 : 2]) // expected-error{{cannot convert value of type 'Double' to expected dictionary key type 'String'}}
-useDictStringInt([nil : 2]) // expected-error{{nil is not compatible with expected dictionary key type 'String'}}
+useDictStringInt(["Hello" : 1, "World" : 2.5])
+// expected-error@-1 {{cannot convert value of type 'Double' to expected dictionary value type 'Int'}}
+useDictStringInt([4.5 : 2])
+// expected-error@-1 {{cannot convert value of type 'Double' to expected dictionary key type 'String'}}
+useDictStringInt([nil : 2])
+// expected-error@-1 {{'nil' is not compatible with expected dictionary key type 'String'}}
+useDictStringInt([7 : 1, "World" : 2])
+// expected-error@-1 {{cannot convert value of type 'Int' to expected dictionary key type 'String'}}
+useDictStringInt(["Hello" : nil])
+// expected-error@-1 {{'nil' is not compatible with expected dictionary value type 'Int'}}
 
-useDictStringInt([7 : 1, "World" : 2]) // expected-error{{cannot convert value of type 'Int' to expected dictionary key type 'String'}}
+typealias FuncBoolToInt = (Bool) -> Int
+let dict1: Dictionary<String, FuncBoolToInt> = ["Hello": nil]
+// expected-error@-1 {{'nil' is not compatible with expected dictionary value type '(Bool) -> Int'}}
 
 // Generic dictionary literals.
 useDict(["Hello" : 1])
@@ -43,18 +52,18 @@ var b3 = [1 : 2.5]
 // <rdar://problem/22584076> QoI: Using array literal init with dictionary produces bogus error
 
 // expected-note @+1 {{did you mean to use a dictionary literal instead?}}
-var _: Dictionary<String, (Int) -> Int>? = [  // expected-error {{contextual type 'Dictionary<String, (Int) -> Int>' cannot be used with array literal}}
+var _: Dictionary<String, (Int) -> Int>? = [  // expected-error {{dictionary of type 'Dictionary<String, (Int) -> Int>' cannot be initialized with array literal}}
   "closure_1" as String, {(Int) -> Int in 0},
   "closure_2", {(Int) -> Int in 0}]
 
 
-var _: Dictionary<String, Int>? = ["foo", 1]  // expected-error {{contextual type 'Dictionary<String, Int>' cannot be used with array literal}}
+var _: Dictionary<String, Int>? = ["foo", 1]  // expected-error {{dictionary of type 'Dictionary<String, Int>' cannot be initialized with array literal}}
 // expected-note @-1 {{did you mean to use a dictionary literal instead?}} {{41-42=:}}
 
-var _: Dictionary<String, Int>? = ["foo", 1, "bar", 42]  // expected-error {{contextual type 'Dictionary<String, Int>' cannot be used with array literal}}
+var _: Dictionary<String, Int>? = ["foo", 1, "bar", 42]  // expected-error {{dictionary of type 'Dictionary<String, Int>' cannot be initialized with array literal}}
 // expected-note @-1 {{did you mean to use a dictionary literal instead?}} {{41-42=:}} {{51-52=:}}
 
-var _: Dictionary<String, Int>? = ["foo", 1.0, 2]  // expected-error {{contextual type 'Dictionary<String, Int>' cannot be used with array literal}}
+var _: Dictionary<String, Int>? = ["foo", 1.0, 2]  // expected-error {{cannot convert value of type '[Any]' to specified type 'Dictionary<String, Int>?'}}
 
 var _: Dictionary<String, Int>? = ["foo" : 1.0]  // expected-error {{cannot convert value of type 'Double' to expected dictionary value type 'Int'}}
 
@@ -102,11 +111,11 @@ func testDefaultExistentials() {
 func rdar32330004_1() -> [String: Any] {
   return ["a""one": 1, "two": 2, "three": 3] // expected-note {{did you mean to use a dictionary literal instead?}}
   // expected-error@-1 2 {{expected ',' separator}}
-  // expected-error@-2 {{contextual type '[String : Any]' cannot be used with array literal}}
+  // expected-error@-2 {{dictionary of type '[String : Any]' cannot be used with array literal}}
 }
 
 func rdar32330004_2() -> [String: Any] {
   return ["a", 0, "one", 1, "two", 2, "three", 3]
-  // expected-error@-1 {{contextual type '[String : Any]' cannot be used with array literal}}
+  // expected-error@-1 {{dictionary of type '[String : Any]' cannot be used with array literal}}
   // expected-note@-2 {{did you mean to use a dictionary literal instead?}} {{14-15=:}} {{24-25=:}} {{34-35=:}} {{46-47=:}}
 }

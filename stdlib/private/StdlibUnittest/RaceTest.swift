@@ -39,7 +39,7 @@
 import SwiftPrivate
 import SwiftPrivateLibcExtras
 import SwiftPrivatePthreadExtras
-#if os(OSX) || os(iOS)
+#if os(macOS) || os(iOS)
 import Darwin
 #elseif os(Linux) || os(FreeBSD) || os(PS4) || os(Android) || os(Cygwin) || os(Haiku)
 import Glibc
@@ -440,7 +440,7 @@ func _masterThreadOneTrial<RT>(_ sharedState: _RaceTestSharedState<RT>) {
     let workerState = _RaceTestWorkerState<RT>()
 
     // Shuffle the data so that threads process it in different order.
-    let shuffle = randomShuffle(identityShuffle)
+    let shuffle = identityShuffle.shuffled()
     workerState.raceData = scatter(sharedState.raceData, shuffle)
     workerState.raceDataShuffle = shuffle
 

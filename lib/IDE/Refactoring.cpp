@@ -30,6 +30,7 @@
 #include "swift/Subsystems.h"
 #include "clang/Rewrite/Core/RewriteBuffer.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 using namespace swift;
 using namespace swift::ide;
@@ -195,7 +196,8 @@ private:
     size_t Colon = Content.find(':'); // FIXME: leading whitespace?
     if (Colon == StringRef::npos) {
       assert(Content.empty());
-      doRenameLabel(Range, RefactoringRangeKind::CallArgumentCombined, NameIndex);
+      doRenameLabel(Range, RefactoringRangeKind::CallArgumentCombined,
+                    NameIndex);
       return;
     }
 
@@ -313,6 +315,14 @@ public:
     bool IsSubscript = Old.base() == "subscript" && Config.IsFunctionLike;
     bool IsInit = Old.base() == "init" && Config.IsFunctionLike;
     bool IsKeywordBase = IsInit || IsSubscript;
+    
+    // Filter out non-semantic keyword basename locations with no labels.
+    // We've already filtered out those in active code, so these are
+    // any appearance of just 'init' or 'subscript' in strings, comments, and
+    // inactive code.
+    if (IsKeywordBase && (Config.Usage == NameUsage::Unknown &&
+                           Resolved.LabelType == LabelRangeType::None))
+      return RegionType::Unmatched;
 
     if (!Config.IsFunctionLike || !IsKeywordBase) {
       if (renameBase(Resolved.Range, RefactoringRangeKind::BaseName))
@@ -352,7 +362,8 @@ public:
                         Resolved.LabelType == LabelRangeType::CallArg;
 
       if (renameLabels(Resolved.LabelRanges, Resolved.LabelType, isCallSite))
-        return RegionType::Mismatch;
+        return Config.Usage == NameUsage::Unknown ?
+            RegionType::Unmatched : RegionType::Mismatch;
     }
 
     return RegionKind;
@@ -376,7 +387,7 @@ public:
 };
 
 class TextReplacementsRenamer : public Renamer {
-  llvm::StringMap<char> &ReplaceTextContext;
+  llvm::StringSet<> &ReplaceTextContext;
   std::vector<Replacement> Replacements;
 
 public:
@@ -384,7 +395,9 @@ public:
 
 private:
   StringRef registerText(StringRef Text) {
-    return ReplaceTextContext.insert({Text, char()}).first->getKey();
+    if (Text.empty())
+      return Text;
+    return ReplaceTextContext.insert(Text).first->getKey();
   }
 
   StringRef getCallArgLabelReplacement(StringRef OldLabelRange,
@@ -486,7 +499,7 @@ private:
 public:
   TextReplacementsRenamer(const SourceManager &SM, StringRef OldName,
                           StringRef NewName,
-                          llvm::StringMap<char> &ReplaceTextContext)
+                          llvm::StringSet<> &ReplaceTextContext)
       : Renamer(SM, OldName), ReplaceTextContext(ReplaceTextContext),
         New(NewName) {
     assert(Old.isValid() && New.isValid());
@@ -897,6 +910,15 @@ ExtractCheckResult checkExtractConditions(ResolvedRangeInfo &RangeInfo,
     return ExtractCheckResult();
   }
 
+  // Disallow extracting certain kinds of statements.
+  if (RangeInfo.Kind == RangeKind::SingleStatement) {
+    Stmt *S = RangeInfo.ContainedNodes[0].get<Stmt *>();
+
+    // These aren't independent statement.
+    if (isa<BraceStmt>(S) || isa<CatchStmt>(S) || isa<CaseStmt>(S))
+      return ExtractCheckResult();
+  }
+
   // Disallow extracting literals.
   if (RangeInfo.Kind == RangeKind::SingleExpression) {
     Expr *E = RangeInfo.ContainedNodes[0].get<Expr*>();
@@ -943,6 +965,7 @@ isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
       success({CannotExtractReason::VoidType});
   }
   }
+  llvm_unreachable("unhandled kind");
 }
 
 static StringRef correctNameInternal(ASTContext &Ctx, StringRef Name,
@@ -1003,20 +1026,18 @@ getNewFuncInsertLoc(DeclContext *DC, DeclContext*& InsertToContext) {
     // getter/setter function and the individual var decl. The pattern binding
     // decl is the position before which we should insert the newly extracted
     // function.
-    if (auto *FD = dyn_cast<FuncDecl>(D)) {
-      if (FD->isAccessor()) {
-        ValueDecl *SD = FD->getAccessorStorageDecl();
-        switch(SD->getKind()) {
-        case DeclKind::Var:
-          if (auto *PBD = static_cast<VarDecl*>(SD)->getParentPatternBinding())
-            D = PBD;
-          break;
-        case DeclKind::Subscript:
-          D = SD;
-          break;
-        default:
-          break;
-        }
+    if (auto *FD = dyn_cast<AccessorDecl>(D)) {
+      ValueDecl *SD = FD->getStorage();
+      switch (SD->getKind()) {
+      case DeclKind::Var:
+        if (auto *PBD = cast<VarDecl>(SD)->getParentPatternBinding())
+          D = PBD;
+        break;
+      case DeclKind::Subscript:
+        D = SD;
+        break;
+      default:
+        break;
       }
     }
 
@@ -1051,9 +1072,9 @@ getNotableRegions(StringRef SourceText, unsigned NameOffset, StringRef Name,
   auto InputBuffer = llvm::MemoryBuffer::getMemBufferCopy(SourceText,"<extract>");
 
   CompilerInvocation Invocation{};
-  Invocation.addInputBuffer(InputBuffer.get());
-  Invocation.getFrontendOptions().Inputs.setPrimaryInput(
-      {0, SelectedInput::InputKind::Buffer});
+
+  Invocation.getFrontendOptions().InputsAndOutputs.addInput(
+      InputFile("<extract>", true, InputBuffer.get()));
   Invocation.getFrontendOptions().ModuleName = "extract";
 
   auto Instance = llvm::make_unique<swift::CompilerInstance>();
@@ -1474,6 +1495,7 @@ isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
     case RangeKind::Invalid:
       return false;
   }
+  llvm_unreachable("unhandled kind");
 }
 
 bool RefactoringActionExtractExpr::performChange() {
@@ -1496,6 +1518,7 @@ isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
     case RangeKind::Invalid:
       return false;
   }
+  llvm_unreachable("unhandled kind");
 }
 bool RefactoringActionExtractRepeatedExpr::performChange() {
   return RefactoringActionExtractExprBase(TheFile, RangeInfo,
@@ -1503,37 +1526,36 @@ bool RefactoringActionExtractRepeatedExpr::performChange() {
                                           EditConsumer).performChange();
 }
 
-// Compute a decl context that is the parent context for all decls in
-// \c DeclaredDecls. Return \c nullptr if no such context exists.
-DeclContext *getCommonDeclContext(ArrayRef<DeclaredDecl> DeclaredDecls) {
-  if (DeclaredDecls.empty())
-    return nullptr;
-
-  DeclContext *CommonDC = DeclaredDecls.front().VD->getDeclContext();
-  for (auto DD : DeclaredDecls) {
-    auto OtherDC = DD.VD->getDeclContext();
-    CommonDC = DeclContext::getCommonParentContext(CommonDC, OtherDC);
-  }
-  return CommonDC;
-}
 
 bool RefactoringActionMoveMembersToExtension::isApplicable(
     ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
   switch (Info.Kind) {
   case RangeKind::SingleDecl:
   case RangeKind::MultiTypeMemberDecl: {
-    DeclContext *CommonDC = getCommonDeclContext(Info.DeclaredDecls);
+    DeclContext *DC = Info.RangeContext;
 
     // The the common decl context is not a nomial type, we cannot create an
     // extension for it
-    if (!CommonDC || !CommonDC->getInnermostDeclarationDeclContext() ||
-        !isa<NominalTypeDecl>(CommonDC->getInnermostDeclarationDeclContext()))
+    if (!DC || !DC->getInnermostDeclarationDeclContext() ||
+        !isa<NominalTypeDecl>(DC->getInnermostDeclarationDeclContext()))
       return false;
+
 
     // Members of types not declared at top file level cannot be extracted
     // to an extension at top file level
-    if (CommonDC->getParent()->getContextKind() != DeclContextKind::FileUnit)
+    if (DC->getParent()->getContextKind() != DeclContextKind::FileUnit)
       return false;
+
+    // Check if contained nodes are all allowed decls.
+    for (auto Node : Info.ContainedNodes) {
+      Decl *D = Node.dyn_cast<Decl*>();
+      if (!D)
+        return false;
+
+      if (isa<AccessorDecl>(D) || isa<DestructorDecl>(D) ||
+          isa<EnumCaseDecl>(D) || isa<EnumElementDecl>(D))
+        return false;
+    }
 
     // We should not move instance variables with storage into the extension
     // because they are not allowed to be declared there
@@ -1541,7 +1563,7 @@ bool RefactoringActionMoveMembersToExtension::isApplicable(
       if (auto ASD = dyn_cast<AbstractStorageDecl>(DD.VD)) {
         // Only disallow storages in the common decl context, allow them in
         // any subtypes
-        if (ASD->hasStorage() && ASD->getDeclContext() == CommonDC) {
+        if (ASD->hasStorage() && ASD->getDeclContext() == DC) {
           return false;
         }
       }
@@ -1556,13 +1578,14 @@ bool RefactoringActionMoveMembersToExtension::isApplicable(
   case RangeKind::Invalid:
     return false;
   }
+  llvm_unreachable("unhandled kind");
 }
 
 bool RefactoringActionMoveMembersToExtension::performChange() {
-  DeclContext *CommonDC = getCommonDeclContext(RangeInfo.DeclaredDecls);
+  DeclContext *DC = RangeInfo.RangeContext;
 
   auto CommonTypeDecl =
-      dyn_cast<NominalTypeDecl>(CommonDC->getInnermostDeclarationDeclContext());
+      dyn_cast<NominalTypeDecl>(DC->getInnermostDeclarationDeclContext());
   assert(CommonTypeDecl && "Not applicable if common parent is no nomial type");
 
   SmallString<64> Buffer;
@@ -1579,118 +1602,164 @@ bool RefactoringActionMoveMembersToExtension::performChange() {
   return false;
 }
 
-struct CollapsibleNestedIfInfo {
-  IfStmt *OuterIf;
-  IfStmt *InnerIf;
-  bool FinishedOuterIf;
-  bool FoundNonCollapsibleItem;
-  CollapsibleNestedIfInfo():
-    OuterIf(nullptr), InnerIf(nullptr),
-    FinishedOuterIf(false), FoundNonCollapsibleItem(false) {}
-  bool isValid() {
-    return OuterIf && InnerIf && FinishedOuterIf && !FoundNonCollapsibleItem;
+namespace {
+// A SingleDecl range may not include all decls actually declared in that range:
+// a var decl has accessors that aren't included. This will find those missing
+// decls.
+class FindAllSubDecls : public SourceEntityWalker {
+  llvm::SmallPtrSetImpl<Decl *> &Found;
+  public:
+  FindAllSubDecls(llvm::SmallPtrSetImpl<Decl *> &found)
+    : Found(found) {}
+
+  bool walkToDeclPre(Decl *D, CharSourceRange range) {
+    // Record this Decl, and skip its contents if we've already touched it.
+    if (!Found.insert(D).second)
+      return false;
+
+    if (auto ASD = dyn_cast<AbstractStorageDecl>(D)) {
+      auto accessors = ASD->getAllAccessors();
+      Found.insert(accessors.begin(), accessors.end());
+    }
+    return true;
   }
 };
+}
+bool RefactoringActionReplaceBodiesWithFatalError::isApplicable(
+  ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+  switch (Info.Kind) {
+  case RangeKind::SingleDecl:
+  case RangeKind::MultiTypeMemberDecl: {
+    llvm::SmallPtrSet<Decl *, 16> Found;
+    for (auto decl : Info.DeclaredDecls) {
+      FindAllSubDecls(Found).walk(decl.VD);
+    }
+    for (auto decl : Found) {
+      auto AFD = dyn_cast<AbstractFunctionDecl>(decl);
+      if (AFD && !AFD->isImplicit())
+        return true;
+    }
 
-static CollapsibleNestedIfInfo findCollapseNestedIfTarget(ResolvedCursorInfo CursorInfo) {
+    return false;
+ }
+  case RangeKind::SingleExpression:
+  case RangeKind::PartOfExpression:
+  case RangeKind::SingleStatement:
+  case RangeKind::MultiStatement:
+  case RangeKind::Invalid:
+    return false;
+  }
+  llvm_unreachable("unhandled kind");
+}
+
+bool RefactoringActionReplaceBodiesWithFatalError::performChange() {
+  const StringRef replacement = "{\nfatalError()\n}";
+  llvm::SmallPtrSet<Decl *, 16> Found;
+  for (auto decl : RangeInfo.DeclaredDecls) {
+    FindAllSubDecls(Found).walk(decl.VD);
+  }
+  for (auto decl : Found) {
+    auto AFD = dyn_cast<AbstractFunctionDecl>(decl);
+    if (!AFD || AFD->isImplicit())
+      continue;
+
+    auto range = AFD->getBodySourceRange();
+    // If we're in replacement mode (i.e. have an edit consumer), we can
+    // rewrite the function body.
+    auto charRange = Lexer::getCharSourceRangeFromSourceRange(SM, range);
+    EditConsumer.accept(SM, charRange, replacement);
+
+  }
+  return false;
+}
+
+static std::pair<IfStmt *, IfStmt *>
+findCollapseNestedIfTarget(ResolvedCursorInfo CursorInfo) {
   if (CursorInfo.Kind != CursorInfoKind::StmtStart)
-    return CollapsibleNestedIfInfo();
-  struct IfStmtFinder: public SourceEntityWalker {
-    SourceLoc StartLoc;
-    CollapsibleNestedIfInfo IfInfo;
-    IfStmtFinder(SourceLoc StartLoc): StartLoc(StartLoc), IfInfo() {}
-    bool finishedInnerIfButNotFinishedOuterIf() {
-      return IfInfo.InnerIf && !IfInfo.FinishedOuterIf;
-    }
-    bool walkToStmtPre(Stmt *S) {
-      if (finishedInnerIfButNotFinishedOuterIf()) {
-        IfInfo.FoundNonCollapsibleItem = true;
-        return false;
-      }
+    return {};
 
-      bool StmtIsOuterIfBrace =
-        IfInfo.OuterIf && !IfInfo.InnerIf && S->getKind() == StmtKind::Brace;
-      if (StmtIsOuterIfBrace) {
-        return true;
-      }
+  // Ensure the statement is 'if' statement. It must not have 'else' clause.
+  IfStmt *OuterIf = dyn_cast<IfStmt>(CursorInfo.TrailingStmt);
+  if (!OuterIf)
+    return {};
+  if (OuterIf->getElseStmt())
+    return {};
 
-      auto *IFS = dyn_cast<IfStmt>(S);
-      if (!IFS) {
-        return false;
-      }
-      if (!IfInfo.OuterIf) {
-        IfInfo.OuterIf = IFS;
-        return true;
-      } else {
-        IfInfo.InnerIf = IFS;
-        return false;
-      }
-    }
-    bool walkToStmtPost(Stmt *S) {
-      assert(S != IfInfo.InnerIf && "Should not traverse inner if statement");
-      if (S == IfInfo.OuterIf) {
-        IfInfo.FinishedOuterIf = true;
-      }
-      return true;
-    }
-    bool walkToDeclPre(Decl *D, CharSourceRange Range) {
-      if (finishedInnerIfButNotFinishedOuterIf()) {
-        IfInfo.FoundNonCollapsibleItem = true;
-        return false;
-      }
-      return true;
-    }
-    bool walkToExprPre(Expr *E) {
-      if (finishedInnerIfButNotFinishedOuterIf()) {
-        IfInfo.FoundNonCollapsibleItem = true;
-        return false;
-      }
-      return true;
-    }
+  // The body must contain a sole inner 'if' statement.
+  auto Body = dyn_cast_or_null<BraceStmt>(OuterIf->getThenStmt());
+  if (!Body || Body->getNumElements() != 1)
+    return {};
 
-  } Walker(CursorInfo.TrailingStmt->getStartLoc());
-  Walker.walk(CursorInfo.TrailingStmt);
-  return Walker.IfInfo;
+  IfStmt *InnerIf =
+      dyn_cast_or_null<IfStmt>(Body->getElement(0).dyn_cast<Stmt *>());
+  if (!InnerIf)
+    return {};
+
+  // Inner 'if' statement also cannot have 'else' clause.
+  if (InnerIf->getElseStmt())
+    return {};
+
+  return {OuterIf, InnerIf};
 }
 
-bool RefactoringActionCollapseNestedIfExpr::
-isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag) {
-  return findCollapseNestedIfTarget(Tok).isValid();
+bool RefactoringActionCollapseNestedIfStmt::
+isApplicable(ResolvedCursorInfo CursorInfo, DiagnosticEngine &Diag) {
+  return findCollapseNestedIfTarget(CursorInfo).first;
 }
 
-bool RefactoringActionCollapseNestedIfExpr::performChange() {
+bool RefactoringActionCollapseNestedIfStmt::performChange() {
   auto Target = findCollapseNestedIfTarget(CursorInfo);
-  if (!Target.isValid())
+  if (!Target.first)
     return true;
-  auto OuterIfConds = Target.OuterIf->getCond().vec();
-  auto InnerIfConds = Target.InnerIf->getCond().vec();
+  auto OuterIf = Target.first;
+  auto InnerIf = Target.second;
 
-  EditorConsumerInsertStream OS(EditConsumer, SM,
-    Lexer::getCharSourceRangeFromSourceRange(
-    SM, Target.OuterIf->getSourceRange()));
+  EditorConsumerInsertStream OS(
+      EditConsumer, SM,
+      Lexer::getCharSourceRangeFromSourceRange(SM, OuterIf->getSourceRange()));
 
-  OS << tok::kw_if << " ";
-  for (auto CI = OuterIfConds.begin(); CI != OuterIfConds.end(); ++CI) {
-    OS << (CI != OuterIfConds.begin() ? ", " : "");
-    OS << Lexer::getCharSourceRangeFromSourceRange(
-      SM, CI->getSourceRange()).str();
+  OS << tok::kw_if << " "; 
+
+  // Emit conditions.
+  bool first = true;
+  for (auto &C : llvm::concat<StmtConditionElement>(OuterIf->getCond(),
+                                                    InnerIf->getCond())) {
+    if (first)
+      first = false;
+    else
+      OS << ", ";
+    OS << Lexer::getCharSourceRangeFromSourceRange(SM, C.getSourceRange())
+              .str();
   }
-  for (auto CI = InnerIfConds.begin(); CI != InnerIfConds.end(); ++CI) {
-    OS << ", " << Lexer::getCharSourceRangeFromSourceRange(
-      SM, CI->getSourceRange()).str();
-  }
-  auto ThenStatementText = Lexer::getCharSourceRangeFromSourceRange(
-    SM, Target.InnerIf->getThenStmt()->getSourceRange()).str();
-  OS << " " << ThenStatementText;
+
+  // Emit body.
+  OS << " ";
+  OS << Lexer::getCharSourceRangeFromSourceRange(
+            SM, InnerIf->getThenStmt()->getSourceRange())
+            .str();
   return false;
 }
 
 static std::unique_ptr<llvm::SetVector<Expr*>>
-  findConcatenatedExpressions(ResolvedRangeInfo Info, ASTContext &Ctx) {
-  if (Info.Kind != RangeKind::SingleExpression
-      && Info.Kind != RangeKind::PartOfExpression)
+findConcatenatedExpressions(ResolvedRangeInfo Info, ASTContext &Ctx) {
+  Expr *E = nullptr;
+
+  switch (Info.Kind) {
+  case RangeKind::SingleExpression:
+    // FIXME: the range info kind should imply non-empty list.
+    if (!Info.ContainedNodes.empty())
+      E = Info.ContainedNodes[0].get<Expr*>();
+    else
+      return nullptr;
+    break;
+  case RangeKind::PartOfExpression:
+    E = Info.CommonExprParent;
+    break;
+  default:
     return nullptr;
-  Expr *E = Info.ContainedNodes[0].get<Expr*>();
+  }
+
+  assert(E);
 
   struct StringInterpolationExprFinder: public SourceEntityWalker {
     std::unique_ptr<llvm::SetVector<Expr*>> Bucket = llvm::
@@ -1713,6 +1782,9 @@ static std::unique_ptr<llvm::SetVector<Expr*>>
 
     bool walkToExprPre(Expr *E) {
       if (E->isImplicit())
+        return true;
+      // FIXME: we should have ErrorType instead of null.
+      if (E->getType().isNull())
         return true;
       auto ExprType = E->getType()->getNominalOrBoundGenericNominal();
       //Only binary concatenation operators should exist in expression
@@ -1791,6 +1863,398 @@ bool RefactoringActionConvertStringsConcatenationToInterpolation::performChange(
   }
   OS << "\"";
   return false;
+}
+
+/// Abstract helper class containing info about an IfExpr
+/// that can be expanded into an IfStmt.
+class ExpandableTernaryExprInfo {
+
+public:
+  virtual ~ExpandableTernaryExprInfo() {}
+
+  virtual IfExpr *getIf() = 0;
+
+  virtual SourceRange getNameRange() = 0;
+
+  virtual Type getType() = 0;
+
+  virtual bool shouldDeclareNameAndType() {
+    return !getType().isNull();
+  }
+
+  virtual bool isValid() {
+
+    //Ensure all public properties are non-nil and valid
+    if (!getIf() || !getNameRange().isValid())
+      return false;
+    if (shouldDeclareNameAndType() && getType().isNull())
+      return false;
+
+    return true; //valid
+  }
+
+  CharSourceRange getNameCharRange(const SourceManager &SM) {
+    return Lexer::getCharSourceRangeFromSourceRange(SM, getNameRange());
+  }
+};
+
+/// Concrete subclass containing info about an AssignExpr
+/// where the source is the expandable IfExpr.
+class ExpandableAssignTernaryExprInfo: public ExpandableTernaryExprInfo {
+
+public:
+  ExpandableAssignTernaryExprInfo(AssignExpr *Assign): Assign(Assign) {}
+
+  IfExpr *getIf() {
+    if (!Assign)
+      return nullptr;
+
+    return dyn_cast<IfExpr>(Assign->getSrc());
+  }
+
+  SourceRange getNameRange() {
+    auto Invalid = SourceRange();
+
+    if (!Assign)
+      return Invalid;
+
+    if (auto dest = Assign->getDest())
+      return dest->getSourceRange();
+
+    return Invalid;
+  }
+
+  Type getType() {
+    return nullptr;
+  }
+
+private:
+  AssignExpr *Assign = nullptr;
+};
+
+/// Concrete subclass containing info about a PatternBindingDecl
+/// where the pattern initializer is the expandable IfExpr.
+class ExpandableBindingTernaryExprInfo: public ExpandableTernaryExprInfo {
+
+public:
+  ExpandableBindingTernaryExprInfo(PatternBindingDecl *Binding):
+  Binding(Binding) {}
+
+  IfExpr *getIf() {
+    if (Binding && Binding->getNumPatternEntries() == 1) {
+      if (auto *Init = Binding->getInit(0)) {
+        return dyn_cast<IfExpr>(Init);
+      }
+    }
+
+    return nullptr;
+  }
+
+  SourceRange getNameRange() {
+    if (auto Pattern = getNamePattern())
+      return Pattern->getSourceRange();
+
+    return SourceRange();
+  }
+
+  Type getType() {
+    if (auto Pattern = getNamePattern())
+      return Pattern->getType();
+
+    return nullptr;
+  }
+
+private:
+  Pattern *getNamePattern() {
+    if (!Binding || Binding->getNumPatternEntries() != 1)
+      return nullptr;
+
+    auto Pattern = Binding->getPattern(0);
+
+    if (!Pattern)
+      return nullptr;
+
+    if (auto TyPattern = dyn_cast<TypedPattern>(Pattern))
+      Pattern = TyPattern->getSubPattern();
+
+    return Pattern;
+  }
+
+  PatternBindingDecl *Binding = nullptr;
+};
+
+std::unique_ptr<ExpandableTernaryExprInfo>
+findExpandableTernaryExpression(ResolvedRangeInfo Info) {
+
+  if (Info.Kind != RangeKind::SingleDecl
+      && Info.Kind != RangeKind:: SingleExpression)
+    return nullptr;
+
+  if (Info.ContainedNodes.size() != 1)
+    return nullptr;
+
+  if (auto D = Info.ContainedNodes[0].dyn_cast<Decl*>())
+    if (auto Binding = dyn_cast<PatternBindingDecl>(D))
+      return llvm::make_unique<ExpandableBindingTernaryExprInfo>(Binding);
+
+  if (auto E = Info.ContainedNodes[0].dyn_cast<Expr*>())
+    if (auto Assign = dyn_cast<AssignExpr>(E))
+      return llvm::make_unique<ExpandableAssignTernaryExprInfo>(Assign);
+
+  return nullptr;
+}
+
+bool RefactoringActionExpandTernaryExpr::
+isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+  auto Target = findExpandableTernaryExpression(Info);
+  return Target && Target->isValid();
+}
+
+bool RefactoringActionExpandTernaryExpr::performChange() {
+  auto Target = findExpandableTernaryExpression(RangeInfo);
+
+  if (!Target || !Target->isValid())
+    return true; //abort
+
+  auto NameCharRange = Target->getNameCharRange(SM);
+
+  auto IfRange = Target->getIf()->getSourceRange();
+  auto IfCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, IfRange);
+
+  auto CondRange = Target->getIf()->getCondExpr()->getSourceRange();
+  auto CondCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, CondRange);
+
+  auto ThenRange = Target->getIf()->getThenExpr()->getSourceRange();
+  auto ThenCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, ThenRange);
+
+  auto ElseRange = Target->getIf()->getElseExpr()->getSourceRange();
+  auto ElseCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, ElseRange);
+
+  llvm::SmallString<64> DeclBuffer;
+  llvm::raw_svector_ostream OS(DeclBuffer);
+
+  llvm::StringRef Space = " ";
+  llvm::StringRef NewLine = "\n";
+
+  if (Target->shouldDeclareNameAndType()) {
+    //Specifier will not be replaced; append after specifier
+    OS << NameCharRange.str() << tok::colon << Space;
+    OS << Target->getType() << NewLine;
+  }
+
+  OS << tok::kw_if << Space;
+  OS << CondCharRange.str() << Space;
+  OS << tok::l_brace << NewLine;
+
+  OS << NameCharRange.str() << Space;
+  OS << tok::equal << Space;
+  OS << ThenCharRange.str() << NewLine;
+
+  OS << tok::r_brace << Space;
+  OS << tok::kw_else << Space;
+  OS << tok::l_brace << NewLine;
+
+  OS << NameCharRange.str() << Space;
+  OS << tok::equal << Space;
+  OS << ElseCharRange.str() << NewLine;
+
+  OS << tok::r_brace;
+
+  //Start replacement with name range, skip the specifier
+  auto ReplaceRange(NameCharRange);
+  ReplaceRange.widen(IfCharRange);
+
+  EditConsumer.accept(SM, ReplaceRange, DeclBuffer.str());
+
+  return false; //don't abort
+}
+
+/// Struct containing info about an IfStmt that can be converted into an IfExpr.
+struct ConvertToTernaryExprInfo {
+  ConvertToTernaryExprInfo() {}
+
+  Expr *AssignDest() {
+
+    if (!Then || !Then->getDest() || !Else || !Else->getDest())
+      return nullptr;
+
+    auto ThenDest = Then->getDest();
+    auto ElseDest = Else->getDest();
+
+    if (ThenDest->getKind() != ElseDest->getKind())
+      return nullptr;
+
+    switch (ThenDest->getKind()) {
+      case ExprKind::DeclRef: {
+        auto ThenRef = dyn_cast<DeclRefExpr>(Then->getDest());
+        auto ElseRef = dyn_cast<DeclRefExpr>(Else->getDest());
+
+        if (!ThenRef || !ThenRef->getDecl() || !ElseRef || !ElseRef->getDecl())
+          return nullptr;
+
+        auto ThenName = ThenRef->getDecl()->getFullName();
+        auto ElseName = ElseRef->getDecl()->getFullName();
+
+        if (ThenName.compare(ElseName) != 0)
+          return nullptr;
+
+        return Then->getDest();
+      }
+      case ExprKind::Tuple: {
+        auto ThenTuple = dyn_cast<TupleExpr>(Then->getDest());
+        auto ElseTuple = dyn_cast<TupleExpr>(Else->getDest());
+
+        if (!ThenTuple || !ElseTuple)
+          return nullptr;
+
+        auto ThenNames = ThenTuple->getElementNames();
+        auto ElseNames = ElseTuple->getElementNames();
+
+        if (!ThenNames.equals(ElseNames))
+          return nullptr;
+
+        return ThenTuple;
+      }
+      default:
+        return nullptr;
+    }
+  }
+
+  Expr *ThenSrc() {
+    if (!Then)
+      return nullptr;
+    return Then->getSrc();
+  }
+
+  Expr *ElseSrc() {
+    if (!Else)
+      return nullptr;
+    return Else->getSrc();
+  }
+
+  bool isValid() {
+    if (!Cond || !AssignDest() || !ThenSrc() || !ElseSrc()
+        || !IfRange.isValid())
+      return false;
+
+    return true;
+  }
+
+  PatternBindingDecl *Binding = nullptr; //optional
+
+  Expr *Cond = nullptr; //required
+  AssignExpr *Then = nullptr; //required
+  AssignExpr *Else = nullptr; //required
+  SourceRange IfRange;
+};
+
+ConvertToTernaryExprInfo
+findConvertToTernaryExpression(ResolvedRangeInfo Info) {
+
+  auto notFound = ConvertToTernaryExprInfo();
+
+  if (Info.Kind != RangeKind::SingleStatement
+      && Info.Kind != RangeKind::MultiStatement)
+    return notFound;
+
+  if (Info.ContainedNodes.empty())
+    return notFound;
+
+  struct AssignExprFinder: public SourceEntityWalker {
+
+    AssignExpr *Assign = nullptr;
+
+    AssignExprFinder(Stmt* S) {
+      if (S)
+        walk(S);
+    }
+
+    virtual bool walkToExprPre(Expr *E) {
+      Assign = dyn_cast<AssignExpr>(E);
+      return false;
+    }
+  };
+
+  ConvertToTernaryExprInfo Target;
+
+  IfStmt *If = nullptr;
+
+  if (Info.ContainedNodes.size() == 1) {
+    if (auto S = Info.ContainedNodes[0].dyn_cast<Stmt*>())
+      If = dyn_cast<IfStmt>(S);
+  }
+
+  if (Info.ContainedNodes.size() == 2) {
+    if (auto D = Info.ContainedNodes[0].dyn_cast<Decl*>())
+      Target.Binding = dyn_cast<PatternBindingDecl>(D);
+    if (auto S = Info.ContainedNodes[1].dyn_cast<Stmt*>())
+      If = dyn_cast<IfStmt>(S);
+  }
+
+  if (!If)
+    return notFound;
+
+  auto CondList = If->getCond();
+
+  if (CondList.size() != 1)
+    return notFound;
+
+  Target.Cond = CondList[0].getBooleanOrNull();
+  Target.IfRange = If->getSourceRange();
+
+  Target.Then = AssignExprFinder(If->getThenStmt()).Assign;
+  Target.Else = AssignExprFinder(If->getElseStmt()).Assign;
+
+  return Target;
+}
+
+bool RefactoringActionConvertToTernaryExpr::
+isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+  return findConvertToTernaryExpression(Info).isValid();
+}
+
+bool RefactoringActionConvertToTernaryExpr::performChange() {
+  auto Target = findConvertToTernaryExpression(RangeInfo);
+
+  if (!Target.isValid())
+    return true; //abort
+
+  llvm::SmallString<64> DeclBuffer;
+  llvm::raw_svector_ostream OS(DeclBuffer);
+
+  llvm::StringRef Space = " ";
+
+  auto IfRange = Target.IfRange;
+  auto ReplaceRange = Lexer::getCharSourceRangeFromSourceRange(SM, IfRange);
+
+  auto CondRange = Target.Cond->getSourceRange();
+  auto CondCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, CondRange);
+
+  auto ThenRange = Target.ThenSrc()->getSourceRange();
+  auto ThenCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, ThenRange);
+
+  auto ElseRange = Target.ElseSrc()->getSourceRange();
+  auto ElseCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, ElseRange);
+
+  CharSourceRange DestCharRange;
+
+  if (Target.Binding) {
+    auto DestRange = Target.Binding->getSourceRange();
+    DestCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, DestRange);
+    ReplaceRange.widen(DestCharRange);
+  } else {
+    auto DestRange = Target.AssignDest()->getSourceRange();
+    DestCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, DestRange);
+  }
+
+  OS << DestCharRange.str() << Space << tok::equal << Space;
+  OS << CondCharRange.str() << Space << tok::question_postfix << Space;
+  OS << ThenCharRange.str() << Space << tok::colon << Space;
+  OS << ElseCharRange.str();
+
+  EditConsumer.accept(SM, ReplaceRange, DeclBuffer.str());
+
+  return false; //don't abort
 }
 
 /// The helper class analyzes a given nominal decl or an extension decl to
@@ -1936,7 +2400,8 @@ collectAvailableRefactoringsAtCursor(SourceFile *SF, unsigned Line,
 
 static EnumDecl* getEnumDeclFromSwitchStmt(SwitchStmt *SwitchS) {
   if (auto SubjectTy = SwitchS->getSubjectExpr()->getType()) {
-    return SubjectTy->getAnyNominal()->getAsEnumOrEnumExtensionContext();
+    // FIXME: Support more complex subject like '(Enum1, Enum2)'.
+    return dyn_cast_or_null<EnumDecl>(SubjectTy->getAnyNominal());
   }
   return nullptr;
 }
@@ -2113,6 +2578,110 @@ bool RefactoringActionLocalizeString::performChange() {
   return false;
 }
 
+static void generateMemberwiseInit(SourceEditConsumer &EditConsumer,
+                            SourceManager &SM,
+                            SmallVectorImpl<std::string>& memberNameVector,
+                            SmallVectorImpl<std::string>& memberTypeVector,
+                            SourceLoc targetLocation) {
+  
+  assert(!memberTypeVector.empty());
+  assert(memberTypeVector.size() == memberNameVector.size());
+  
+  EditConsumer.accept(SM, targetLocation, "\ninternal init(");
+  
+  for (size_t i = 0, n = memberTypeVector.size(); i < n ; i++) {
+    EditConsumer.accept(SM, targetLocation, memberNameVector[i] + ": " +
+                        memberTypeVector[i]);
+    
+    if (i != memberTypeVector.size() - 1) {
+      EditConsumer.accept(SM, targetLocation, ", ");
+    }
+  }
+  
+  EditConsumer.accept(SM, targetLocation, ") {\n");
+  
+  for (auto varName: memberNameVector) {
+    EditConsumer.accept(SM, targetLocation,
+                        "self." + varName + " = " + varName + "\n");
+  }
+  
+  EditConsumer.accept(SM, targetLocation, "}\n");
+}
+  
+static SourceLoc collectMembersForInit(ResolvedCursorInfo CursorInfo,
+                           SmallVectorImpl<std::string>& memberNameVector,
+                           SmallVectorImpl<std::string>& memberTypeVector) {
+  
+  if (!CursorInfo.ValueD)
+    return SourceLoc();
+  
+  ClassDecl *classDecl = dyn_cast<ClassDecl>(CursorInfo.ValueD);
+  if (!classDecl || classDecl->getStoredProperties().empty() ||
+      CursorInfo.IsRef) {
+    return SourceLoc();
+  }
+  
+  SourceLoc bracesStart = classDecl->getBraces().Start;
+  if (!bracesStart.isValid())
+    return SourceLoc();
+  
+  SourceLoc targetLocation = bracesStart.getAdvancedLoc(1);
+  if (!targetLocation.isValid())
+    return SourceLoc();
+  
+  for (auto varDecl : classDecl->getStoredProperties()) {
+    auto parentPatternBinding = varDecl->getParentPatternBinding();
+    if (!parentPatternBinding)
+      continue;
+    
+    auto varDeclIndex =
+      parentPatternBinding->getPatternEntryIndexForVarDecl(varDecl);
+    
+    if (auto init = varDecl->getParentPatternBinding()->getInit(varDeclIndex)) {
+      if (init->getStartLoc().isValid())
+        continue;
+    }
+    
+    StringRef memberName = varDecl->getName().str();
+    memberNameVector.push_back(memberName.str());
+    
+    std::string memberType = varDecl->getType().getString();
+    memberTypeVector.push_back(memberType);
+  }
+  
+  if (memberNameVector.empty() || memberTypeVector.empty()) {
+    return SourceLoc();
+  }
+  
+  return targetLocation;
+}
+
+bool RefactoringActionMemberwiseInitLocalRefactoring::
+isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag) {
+  
+  SmallVector<std::string, 8> memberNameVector;
+  SmallVector<std::string, 8> memberTypeVector;
+  
+  return collectMembersForInit(Tok, memberNameVector,
+                               memberTypeVector).isValid();
+}
+    
+bool RefactoringActionMemberwiseInitLocalRefactoring::performChange() {
+  
+  SmallVector<std::string, 8> memberNameVector;
+  SmallVector<std::string, 8> memberTypeVector;
+  
+  SourceLoc targetLocation = collectMembersForInit(CursorInfo, memberNameVector,
+                                         memberTypeVector);
+  if (targetLocation.isInvalid())
+    return true;
+  
+  generateMemberwiseInit(EditConsumer, SM, memberNameVector,
+                         memberTypeVector, targetLocation);
+  
+  return false;
+}
+
 static CharSourceRange
   findSourceRangeToWrapInCatch(ResolvedCursorInfo CursorInfo,
                                SourceFile *TheFile,
@@ -2125,7 +2694,7 @@ static CharSourceRange
   ContextFinder Finder(*TheFile, Node, NodeChecker);
   Finder.resolve();
   auto Contexts = Finder.getContexts();
-  if (Contexts.size() == 0)
+  if (Contexts.empty())
     return CharSourceRange();
   auto TargetNode = Contexts.back();
   BraceStmt *BStmt = dyn_cast<BraceStmt>(TargetNode.dyn_cast<Stmt*>());
@@ -2278,6 +2847,10 @@ static CallExpr *findTrailingClosureTarget(SourceManager &SM,
     return nullptr;
   CallExpr *CE = cast<CallExpr>(Finder.getContexts().back().get<Expr*>());
 
+  if (CE->hasTrailingClosure())
+    // Call expression already has a trailing closure.
+    return nullptr;
+
   // The last arugment is a closure?
   Expr *Args = CE->getArg();
   if (!Args)
@@ -2314,7 +2887,7 @@ bool RefactoringActionTrailingClosure::performChange() {
     return true;
   Expr *Args = CE->getArg();
   if (auto *TSE = dyn_cast<TupleShuffleExpr>(Args))
-    Args = TSE;
+    Args = TSE->getSubExpr();
 
   Expr *ClosureArg = nullptr;
   Expr *PrevArg = nullptr;
@@ -2400,6 +2973,7 @@ static bool rangeStartMayNeedRename(ResolvedRangeInfo Info) {
     case RangeKind::Invalid:
       return false;
   }
+  llvm_unreachable("unhandled kind");
 }
 }// end of anonymous namespace
 
@@ -2411,6 +2985,7 @@ getDescriptiveRefactoringKindName(RefactoringKind Kind) {
 #define REFACTORING(KIND, NAME, ID) case RefactoringKind::KIND: return NAME;
 #include "swift/IDE/RefactoringKinds.def"
     }
+    llvm_unreachable("unhandled kind");
   }
 
   StringRef swift::ide::
@@ -2429,6 +3004,7 @@ getDescriptiveRefactoringKindName(RefactoringKind Kind) {
       case RenameAvailableKind::Unavailable_decl_from_clang:
         return "cannot rename a Clang symbol from its Swift reference";
     }
+    llvm_unreachable("unhandled kind");
   }
 
 SourceLoc swift::ide::RangeConfig::getStart(SourceManager &SM) {
@@ -2464,6 +3040,7 @@ struct swift::ide::FindRenameRangesAnnotatingConsumer::Implementation {
       case RefactoringRangeKind::SelectorArgumentLabel:
         return "sel";
     }
+    llvm_unreachable("unhandled kind");
   }
   void accept(SourceManager &SM, const RenameRangeDetail &Range) {
     std::string NewText;
@@ -2488,6 +3065,8 @@ swift::ide::FindRenameRangesAnnotatingConsumer::~FindRenameRangesAnnotatingConsu
 void swift::ide::FindRenameRangesAnnotatingConsumer::
 accept(SourceManager &SM, RegionType RegionType,
        ArrayRef<RenameRangeDetail> Ranges) {
+  if (RegionType == RegionType::Mismatch || RegionType == RegionType::Unmatched)
+    return;
   for (const auto &Range : Ranges) {
     Impl.accept(SM, Range);
   }
@@ -2504,19 +3083,22 @@ swift::ide::collectRenameAvailabilityInfo(const ValueDecl *VD,
     AvailKind = RenameAvailableKind::Unavailable_has_no_location;
   } else if (!VD->hasName()) {
     AvailKind = RenameAvailableKind::Unavailable_has_no_name;
-  } else if (!VD->hasAccess()) {
-    return llvm::makeArrayRef(Scratch);
   }
 
   if (isa<AbstractFunctionDecl>(VD)) {
     // Disallow renaming accessors.
-    if (auto FD = dyn_cast<FuncDecl>(VD)) {
-      if (FD->isAccessor())
-        return Scratch;
-    }
+    if (isa<AccessorDecl>(VD))
+      return Scratch;
+
     // Disallow renaming deinit.
     if (isa<DestructorDecl>(VD))
       return Scratch;
+    
+    // Disallow renaming init with no arguments.
+    if (auto CD = dyn_cast<ConstructorDecl>(VD)) {
+      if (!CD->getParameters()->size())
+        return Scratch;
+    }
   }
 
   // Always return local rename for parameters.
@@ -2599,9 +3181,14 @@ collectAvailableRefactorings(SourceFile *SF, RangeConfig Range,
                          Range.getEnd(SF->getASTContext().SourceMgr));
   ResolvedRangeInfo Result = Resolver.resolve();
 
+  bool enableInternalRefactoring = getenv("SWIFT_ENABLE_INTERNAL_REFACTORING_ACTIONS");
+
 #define RANGE_REFACTORING(KIND, NAME, ID)                                     \
   if (RefactoringAction##KIND::isApplicable(Result, DiagEngine))              \
     Scratch.push_back(RefactoringKind::KIND);
+#define INTERNAL_RANGE_REFACTORING(KIND, NAME, ID)                            \
+  if (enableInternalRefactoring)                                              \
+    RANGE_REFACTORING(KIND, NAME, ID)
 #include "swift/IDE/RefactoringKinds.def"
 
   RangeStartMayNeedRename = rangeStartMayNeedRename(Result);
@@ -2636,6 +3223,7 @@ case RefactoringKind::KIND: {                                                  \
     case RefactoringKind::None:
       llvm_unreachable("should not enter here.");
   }
+  llvm_unreachable("unhandled kind");
 }
 
 static std::vector<ResolvedLoc>
@@ -2709,7 +3297,7 @@ int swift::ide::syntacticRename(SourceFile *SF, ArrayRef<RenameLoc> RenameLocs,
     return true; // Already diagnosed.
 
   size_t index = 0;
-  llvm::StringMap<char> ReplaceTextContext;
+  llvm::StringSet<> ReplaceTextContext;
   for(const RenameLoc &Rename: RenameLocs) {
     ResolvedLoc &Resolved = ResolvedLocs[index++];
     TextReplacementsRenamer Renamer(SM, Rename.OldName, Rename.NewName,

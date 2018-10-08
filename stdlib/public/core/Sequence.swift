@@ -336,12 +336,16 @@ public protocol Sequence {
           SubSequence.SubSequence == SubSequence
 
   /// Returns an iterator over the elements of this sequence.
-  func makeIterator() -> Iterator
+  __consuming func makeIterator() -> Iterator
 
-  /// A value less than or equal to the number of elements in
-  /// the sequence, calculated nondestructively.
+  /// A value less than or equal to the number of elements in the sequence,
+  /// calculated nondestructively.
   ///
-  /// - Complexity: O(1)
+  /// The default implementation returns 0. If you provide your own
+  /// implementation, make sure to compute the value nondestructively.
+  ///
+  /// - Complexity: O(1), except if the sequence also conforms to `Collection`.
+  ///   In this case, see the documentation of `Collection.underestimatedCount`.
   var underestimatedCount: Int { get }
 
   /// Returns an array containing the results of mapping the given closure
@@ -361,6 +365,8 @@ public protocol Sequence {
   ///   value of the same or of a different type.
   /// - Returns: An array containing the transformed elements of this
   ///   sequence.
+  ///
+  /// - Complexity: O(*n*), where *n* is the length of the sequence.
   func map<T>(
     _ transform: (Element) throws -> T
   ) rethrows -> [T]
@@ -380,7 +386,9 @@ public protocol Sequence {
   ///   sequence as its argument and returns a Boolean value indicating
   ///   whether the element should be included in the returned array.
   /// - Returns: An array of the elements that `isIncluded` allowed.
-  func filter(
+  ///
+  /// - Complexity: O(*n*), where *n* is the length of the sequence.
+  __consuming func filter(
     _ isIncluded: (Element) throws -> Bool
   ) rethrows -> [Element]
 
@@ -431,14 +439,14 @@ public protocol Sequence {
   ///     print(numbers.dropFirst(10))
   ///     // Prints "[]"
   ///
-  /// - Parameter n: The number of elements to drop from the beginning of
-  ///   the sequence. `n` must be greater than or equal to zero.
+  /// - Parameter k: The number of elements to drop from the beginning of
+  ///   the sequence. `k` must be greater than or equal to zero.
   /// - Returns: A subsequence starting after the specified number of
   ///   elements.
   ///
-  /// - Complexity: O(*n*), where *n* is the number of elements to drop from
+  /// - Complexity: O(*k*), where *k* is the number of elements to drop from
   ///   the beginning of the sequence.
-  func dropFirst(_ n: Int) -> SubSequence
+  __consuming func dropFirst(_ k: Int) -> SubSequence
 
   /// Returns a subsequence containing all but the specified number of final
   /// elements.
@@ -453,12 +461,12 @@ public protocol Sequence {
   ///     print(numbers.dropLast(10))
   ///     // Prints "[]"
   ///
-  /// - Parameter n: The number of elements to drop off the end of the
-  ///   sequence. `n` must be greater than or equal to zero.
+  /// - Parameter k: The number of elements to drop off the end of the
+  ///   sequence. `k` must be greater than or equal to zero.
   /// - Returns: A subsequence leaving off the specified number of elements.
   ///
   /// - Complexity: O(*n*), where *n* is the length of the sequence.
-  func dropLast(_ n: Int) -> SubSequence
+  __consuming func dropLast(_ k: Int) -> SubSequence
 
   /// Returns a subsequence by skipping elements while `predicate` returns
   /// `true` and returning the remaining elements.
@@ -467,8 +475,8 @@ public protocol Sequence {
   ///   sequence as its argument and returns a Boolean value indicating
   ///   whether the element is a match.
   ///
-  /// - Complexity: O(*n*), where *n* is the length of the collection.
-  func drop(
+  /// - Complexity: O(*n*), where *n* is the length of the sequence.
+  __consuming func drop(
     while predicate: (Element) throws -> Bool
   ) rethrows -> SubSequence
 
@@ -488,7 +496,10 @@ public protocol Sequence {
   ///   `maxLength` must be greater than or equal to zero.
   /// - Returns: A subsequence starting at the beginning of this sequence
   ///   with at most `maxLength` elements.
-  func prefix(_ maxLength: Int) -> SubSequence
+  ///
+  /// - Complexity: O(*k*), where *k* is the number of elements to select from
+  ///   the beginning of the sequence.
+  __consuming func prefix(_ maxLength: Int) -> SubSequence
 
   /// Returns a subsequence containing the initial, consecutive elements that
   /// satisfy the given predicate.
@@ -511,8 +522,8 @@ public protocol Sequence {
   /// - Returns: A subsequence of the initial, consecutive elements that
   ///   satisfy `predicate`.
   ///
-  /// - Complexity: O(*n*), where *n* is the length of the collection.
-  func prefix(
+  /// - Complexity: O(*k*), where *k* is the length of the result.
+  __consuming func prefix(
     while predicate: (Element) throws -> Bool
   ) rethrows -> SubSequence
 
@@ -535,7 +546,7 @@ public protocol Sequence {
   ///   at most `maxLength` elements.
   ///
   /// - Complexity: O(*n*), where *n* is the length of the sequence.
-  func suffix(_ maxLength: Int) -> SubSequence
+  __consuming func suffix(_ maxLength: Int) -> SubSequence
 
   /// Returns the longest possible subsequences of the sequence, in order, that
   /// don't contain elements satisfying the given predicate.
@@ -586,7 +597,9 @@ public protocol Sequence {
   ///   - isSeparator: A closure that returns `true` if its argument should be
   ///     used to split the sequence; otherwise, `false`.
   /// - Returns: An array of subsequences, split from this sequence's elements.
-  func split(
+  ///
+  /// - Complexity: O(*n*), where *n* is the length of the sequence.
+  __consuming func split(
     maxSplits: Int, omittingEmptySubsequences: Bool,
     whereSeparator isSeparator: (Element) throws -> Bool
   ) rethrows -> [SubSequence]
@@ -603,58 +616,61 @@ public protocol Sequence {
 
   /// Create a native array buffer containing the elements of `self`,
   /// in the same order.
-  func _copyToContiguousArray() -> ContiguousArray<Element>
+  __consuming func _copyToContiguousArray() -> ContiguousArray<Element>
 
   /// Copy `self` into an unsafe buffer, returning a partially-consumed
   /// iterator with any elements that didn't fit remaining.
-  func _copyContents(
+  __consuming func _copyContents(
     initializing ptr: UnsafeMutableBufferPointer<Element>
   ) -> (Iterator,UnsafeMutableBufferPointer<Element>.Index)
+}
+
+// Provides a default associated type witness for Iterator when the
+// Self type is both a Sequence and an Iterator.
+extension Sequence where Self: IteratorProtocol {
+  // @_implements(Sequence, Iterator)
+  public typealias _Default_Iterator = Self
 }
 
 /// A default makeIterator() function for `IteratorProtocol` instances that
 /// are declared to conform to `Sequence`
 extension Sequence where Self.Iterator == Self {
   /// Returns an iterator over the elements of this sequence.
-  @_inlineable
-  public func makeIterator() -> Self {
+  @inlinable
+  public __consuming func makeIterator() -> Self {
     return self
   }
 }
-
 
 /// A sequence that lazily consumes and drops `n` elements from an underlying
 /// `Base` iterator before possibly returning the first available element.
 ///
 /// The underlying iterator's sequence may be infinite.
-@_versioned
+@usableFromInline
 @_fixed_layout
 internal struct _DropFirstSequence<Base : IteratorProtocol>
     : Sequence, IteratorProtocol {
 
-  @_versioned
+  @usableFromInline
   internal var _iterator: Base
-  @_versioned
+  @usableFromInline
   internal let _limit: Int
-  @_versioned
+  @usableFromInline
   internal var _dropped: Int
 
-  @_versioned
-  @_inlineable
+  @inlinable
   internal init(_iterator: Base, limit: Int, dropped: Int = 0) {
     self._iterator = _iterator
     self._limit = limit
     self._dropped = dropped
   }
 
-  @_versioned
-  @_inlineable
-  internal func makeIterator() -> _DropFirstSequence<Base> {
+  @inlinable
+  __consuming internal func makeIterator() -> _DropFirstSequence<Base> {
     return self
   }
 
-  @_versioned
-  @_inlineable
+  @inlinable
   internal mutating func next() -> Base.Element? {
     while _dropped < _limit {
       if _iterator.next() == nil {
@@ -666,9 +682,8 @@ internal struct _DropFirstSequence<Base : IteratorProtocol>
     return _iterator.next()
   }
 
-  @_versioned
-  @_inlineable
-  internal func dropFirst(_ n: Int) -> AnySequence<Base.Element> {
+  @inlinable
+  internal __consuming func dropFirst(_ k: Int) -> AnySequence<Base.Element> {
     // If this is already a _DropFirstSequence, we need to fold in
     // the current drop count and drop limit so no data is lost.
     //
@@ -676,7 +691,7 @@ internal struct _DropFirstSequence<Base : IteratorProtocol>
     // [1,2,3,4].dropFirst(2).
     return AnySequence(
       _DropFirstSequence(
-        _iterator: _iterator, limit: _limit + n, dropped: _dropped))
+        _iterator: _iterator, limit: _limit + k, dropped: _dropped))
   }
 }
 
@@ -685,32 +700,29 @@ internal struct _DropFirstSequence<Base : IteratorProtocol>
 ///
 /// The underlying iterator's sequence may be infinite.
 @_fixed_layout
-@_versioned
+@usableFromInline
 internal struct _PrefixSequence<Base : IteratorProtocol>
     : Sequence, IteratorProtocol {
-  @_versioned
+  @usableFromInline
   internal let _maxLength: Int
-  @_versioned
+  @usableFromInline
   internal var _iterator: Base
-  @_versioned
+  @usableFromInline
   internal var _taken: Int
 
-  @_versioned
-  @_inlineable
+  @inlinable
   internal init(_iterator: Base, maxLength: Int, taken: Int = 0) {
     self._iterator = _iterator
     self._maxLength = maxLength
     self._taken = taken
   }
 
-  @_versioned
-  @_inlineable
-  internal func makeIterator() -> _PrefixSequence<Base> {
+  @inlinable
+  __consuming internal func makeIterator() -> _PrefixSequence<Base> {
     return self
   }
 
-  @_versioned
-  @_inlineable
+  @inlinable
   internal mutating func next() -> Base.Element? {
     if _taken >= _maxLength { return nil }
     _taken += 1
@@ -723,9 +735,8 @@ internal struct _PrefixSequence<Base : IteratorProtocol>
     return nil
   }
 
-  @_versioned
-  @_inlineable
-  internal func prefix(_ maxLength: Int) -> AnySequence<Base.Element> {
+  @inlinable
+  internal __consuming func prefix(_ maxLength: Int) -> AnySequence<Base.Element> {
     return AnySequence(
       _PrefixSequence(
         _iterator: _iterator,
@@ -739,19 +750,19 @@ internal struct _PrefixSequence<Base : IteratorProtocol>
 ///
 /// The underlying iterator's sequence may be infinite.
 @_fixed_layout
-@_versioned
+@usableFromInline
 internal struct _DropWhileSequence<Base : IteratorProtocol>
     : Sequence, IteratorProtocol {
 
-      typealias Element = Base.Element
+  @usableFromInline
+  typealias Element = Base.Element
 
-  @_versioned
+  @usableFromInline
   internal var _iterator: Base
-  @_versioned
+  @usableFromInline
   internal var _nextElement: Base.Element?
 
-  @_versioned
-  @_inlineable
+  @inlinable
   internal init(
     iterator: Base,
     nextElement: Base.Element?,
@@ -765,14 +776,12 @@ internal struct _DropWhileSequence<Base : IteratorProtocol>
     }
   }
 
-  @_versioned
-  @_inlineable
-  internal func makeIterator() -> _DropWhileSequence<Base> {
+  @inlinable
+  __consuming internal func makeIterator() -> _DropWhileSequence<Base> {
     return self
   }
 
-  @_versioned
-  @_inlineable
+  @inlinable
   internal mutating func next() -> Element? {
     guard _nextElement != nil else {
       return _iterator.next()
@@ -783,9 +792,8 @@ internal struct _DropWhileSequence<Base : IteratorProtocol>
     return next
   }
 
-  @_versioned
-  @_inlineable
-  internal func drop(
+  @inlinable
+  internal __consuming func drop(
     while predicate: (Element) throws -> Bool
   ) rethrows -> AnySequence<Element> {
     // If this is already a _DropWhileSequence, avoid multiple
@@ -818,7 +826,9 @@ extension Sequence {
   ///   value of the same or of a different type.
   /// - Returns: An array containing the transformed elements of this
   ///   sequence.
-  @_inlineable
+  ///
+  /// - Complexity: O(*n*), where *n* is the length of the sequence.
+  @inlinable
   public func map<T>(
     _ transform: (Element) throws -> T
   ) rethrows -> [T] {
@@ -854,8 +864,10 @@ extension Sequence {
   ///   sequence as its argument and returns a Boolean value indicating
   ///   whether the element should be included in the returned array.
   /// - Returns: An array of the elements that `isIncluded` allowed.
-  @_inlineable
-  public func filter(
+  ///
+  /// - Complexity: O(*n*), where *n* is the length of the sequence.
+  @inlinable
+  public __consuming func filter(
     _ isIncluded: (Element) throws -> Bool
   ) rethrows -> [Element] {
     return try _filter(isIncluded)
@@ -879,23 +891,29 @@ extension Sequence {
     return Array(result)
   }
 
-  /// Returns a value less than or equal to the number of elements in
-  /// the sequence, nondestructively.
+  /// A value less than or equal to the number of elements in the sequence,
+  /// calculated nondestructively.
   ///
-  /// - Complexity: O(*n*)
-  @_inlineable
+  /// The default implementation returns 0. If you provide your own
+  /// implementation, make sure to compute the value nondestructively.
+  ///
+  /// - Complexity: O(1), except if the sequence also conforms to `Collection`.
+  ///   In this case, see the documentation of `Collection.underestimatedCount`.
+  @inlinable
   public var underestimatedCount: Int {
     return 0
   }
 
-  @_inlineable
+  @inlinable
+  @inline(__always)
   public func _preprocessingPass<R>(
     _ preprocess: () throws -> R
   ) rethrows -> R? {
     return nil
   }
 
-  @_inlineable
+  @inlinable
+  @inline(__always)
   public func _customContainsEquatableElement(
     _ element: Iterator.Element
   ) -> Bool? {
@@ -931,7 +949,7 @@ extension Sequence {
   ///
   /// - Parameter body: A closure that takes an element of the sequence as a
   ///   parameter.
-  @_inlineable
+  @inlinable
   public func forEach(
     _ body: (Element) throws -> Void
   ) rethrows {
@@ -939,12 +957,6 @@ extension Sequence {
       try body(element)
     }
   }
-}
-
-@_versioned
-@_fixed_layout
-internal enum _StopIteration : Error {
-  case stop
 }
 
 extension Sequence {
@@ -965,20 +977,18 @@ extension Sequence {
   ///   element is a match.
   /// - Returns: The first element of the sequence that satisfies `predicate`,
   ///   or `nil` if there is no element that satisfies `predicate`.
-  @_inlineable
+  ///
+  /// - Complexity: O(*n*), where *n* is the length of the sequence.
+  @inlinable
   public func first(
     where predicate: (Element) throws -> Bool
   ) rethrows -> Element? {
-    var foundElement: Element?
-    do {
-      try self.forEach {
-        if try predicate($0) {
-          foundElement = $0
-          throw _StopIteration.stop
-        }
+    for element in self  {
+      if try predicate(element) {
+        return element
       }
-    } catch is _StopIteration { }
-    return foundElement
+    }
+    return nil
   }
 }
 
@@ -1028,8 +1038,10 @@ extension Sequence where Element : Equatable {
   ///     start or end of the sequence. If `true`, only nonempty subsequences
   ///     are returned. The default value is `true`.
   /// - Returns: An array of subsequences, split from this sequence's elements.
-  @_inlineable
-  public func split(
+  ///
+  /// - Complexity: O(*n*), where *n* is the length of the sequence.
+  @inlinable
+  public __consuming func split(
     separator: Element,
     maxSplits: Int = Int.max,
     omittingEmptySubsequences: Bool = true
@@ -1090,8 +1102,10 @@ extension Sequence where SubSequence == AnySequence<Element> {
   ///   - isSeparator: A closure that returns `true` if its argument should be
   ///     used to split the sequence; otherwise, `false`.
   /// - Returns: An array of subsequences, split from this sequence's elements.
-  @_inlineable
-  public func split(
+  ///
+  /// - Complexity: O(*n*), where *n* is the length of the sequence.
+  @inlinable
+  public __consuming func split(
     maxSplits: Int = Int.max,
     omittingEmptySubsequences: Bool = true,
     whereSeparator isSeparator: (Element) throws -> Bool
@@ -1153,9 +1167,10 @@ extension Sequence where SubSequence == AnySequence<Element> {
   ///
   /// - Parameter maxLength: The maximum number of elements to return. The
   ///   value of `maxLength` must be greater than or equal to zero.
+  ///
   /// - Complexity: O(*n*), where *n* is the length of the sequence.
-  @_inlineable
-  public func suffix(_ maxLength: Int) -> AnySequence<Element> {
+  @inlinable
+  public __consuming func suffix(_ maxLength: Int) -> AnySequence<Element> {
     _precondition(maxLength >= 0, "Can't take a suffix of negative length from a sequence")
     if maxLength == 0 { return AnySequence([]) }
     // FIXME: <rdar://problem/21885650> Create reusable RingBuffer<T>
@@ -1198,17 +1213,19 @@ extension Sequence where SubSequence == AnySequence<Element> {
   ///     print(numbers.dropFirst(10))
   ///     // Prints "[]"
   ///
-  /// - Parameter n: The number of elements to drop from the beginning of
-  ///   the sequence. `n` must be greater than or equal to zero.
+  /// - Parameter k: The number of elements to drop from the beginning of
+  ///   the sequence. `k` must be greater than or equal to zero.
   /// - Returns: A subsequence starting after the specified number of
   ///   elements.
   ///
-  /// - Complexity: O(1).
-  @_inlineable
-  public func dropFirst(_ n: Int) -> AnySequence<Element> {
-    _precondition(n >= 0, "Can't drop a negative number of elements from a sequence")
-    if n == 0 { return AnySequence(self) }
-    return AnySequence(_DropFirstSequence(_iterator: makeIterator(), limit: n))
+  /// - Complexity: O(1), with O(*k*) deferred to each iteration of the result,
+  ///   where *k* is the number of elements to drop from the beginning of
+  ///   the sequence.
+  @inlinable
+  public __consuming func dropFirst(_ k: Int) -> AnySequence<Element> {
+    _precondition(k >= 0, "Can't drop a negative number of elements from a sequence")
+    if k == 0 { return AnySequence(self) }
+    return AnySequence(_DropFirstSequence(_iterator: makeIterator(), limit: k))
   }
 
   /// Returns a subsequence containing all but the given number of final
@@ -1229,28 +1246,28 @@ extension Sequence where SubSequence == AnySequence<Element> {
   /// - Returns: A subsequence leaving off the specified number of elements.
   ///
   /// - Complexity: O(*n*), where *n* is the length of the sequence.
-  @_inlineable
-  public func dropLast(_ n: Int) -> AnySequence<Element> {
-    _precondition(n >= 0, "Can't drop a negative number of elements from a sequence")
-    if n == 0 { return AnySequence(self) }
+  @inlinable
+  public __consuming func dropLast(_ k: Int) -> AnySequence<Element> {
+    _precondition(k >= 0, "Can't drop a negative number of elements from a sequence")
+    if k == 0 { return AnySequence(self) }
 
     // FIXME: <rdar://problem/21885650> Create reusable RingBuffer<T>
     // Put incoming elements from this sequence in a holding tank, a ring buffer
-    // of size <= n. If more elements keep coming in, pull them out of the
+    // of size <= k. If more elements keep coming in, pull them out of the
     // holding tank into the result, an `Array`. This saves
-    // `n` * sizeof(Element) of memory, because slices keep the entire
+    // `k` * sizeof(Element) of memory, because slices keep the entire
     // memory of an `Array` alive.
     var result: [Element] = []
     var ringBuffer: [Element] = []
     var i = ringBuffer.startIndex
 
     for element in self {
-      if ringBuffer.count < n {
+      if ringBuffer.count < k {
         ringBuffer.append(element)
       } else {
         result.append(ringBuffer[i])
         ringBuffer[i] = element
-        i = ringBuffer.index(after: i) % n
+        i = ringBuffer.index(after: i) % k
       }
     }
     return AnySequence(result)
@@ -1277,9 +1294,10 @@ extension Sequence where SubSequence == AnySequence<Element> {
   /// - Returns: A subsequence starting after the initial, consecutive elements
   ///   that satisfy `predicate`.
   ///
-  /// - Complexity: O(*n*), where *n* is the length of the collection.
-  @_inlineable
-  public func drop(
+  /// - Complexity: O(*k*), where *k* is the number of elements to drop from
+  ///   the beginning of the sequence.
+  @inlinable
+  public __consuming func drop(
     while predicate: (Element) throws -> Bool
   ) rethrows -> AnySequence<Element> {
     return try AnySequence(
@@ -1305,8 +1323,8 @@ extension Sequence where SubSequence == AnySequence<Element> {
   ///   with at most `maxLength` elements.
   ///
   /// - Complexity: O(1)
-  @_inlineable
-  public func prefix(_ maxLength: Int) -> AnySequence<Element> {
+  @inlinable
+  public __consuming func prefix(_ maxLength: Int) -> AnySequence<Element> {
     _precondition(maxLength >= 0, "Can't take a prefix of negative length from a sequence")
     if maxLength == 0 {
       return AnySequence(EmptyCollection<Element>())
@@ -1336,9 +1354,9 @@ extension Sequence where SubSequence == AnySequence<Element> {
   /// - Returns: A subsequence of the initial, consecutive elements that
   ///   satisfy `predicate`.
   ///
-  /// - Complexity: O(*n*), where *n* is the length of the collection.
-  @_inlineable
-  public func prefix(
+  /// - Complexity: O(*k*), where *k* is the length of the result.
+  @inlinable
+  public __consuming func prefix(
     while predicate: (Element) throws -> Bool
   ) rethrows -> AnySequence<Element> {
     var result: [Element] = []
@@ -1373,8 +1391,8 @@ extension Sequence {
   ///   sequence.
   ///
   /// - Complexity: O(1)
-  @_inlineable
-  public func dropFirst() -> SubSequence { return dropFirst(1) }
+  @inlinable
+  public __consuming func dropFirst() -> SubSequence { return dropFirst(1) }
 
   /// Returns a subsequence containing all but the last element of the
   /// sequence.
@@ -1394,8 +1412,8 @@ extension Sequence {
   /// - Returns: A subsequence leaving off the last element of the sequence.
   ///
   /// - Complexity: O(*n*), where *n* is the length of the sequence.
-  @_inlineable
-  public func dropLast() -> SubSequence  { return dropLast(1) }
+  @inlinable
+  public __consuming func dropLast() -> SubSequence  { return dropLast(1) }
 }
 
 extension Sequence {
@@ -1406,8 +1424,8 @@ extension Sequence {
   ///
   /// - Postcondition: The `Pointee`s at `buffer[startIndex..<returned index]` are
   ///   initialized.
-  @_inlineable
-  public func _copyContents(
+  @inlinable
+  public __consuming func _copyContents(
     initializing buffer: UnsafeMutableBufferPointer<Element>
   ) -> (Iterator,UnsafeMutableBufferPointer<Element>.Index) {
       var it = self.makeIterator()
@@ -1434,11 +1452,11 @@ extension Sequence {
 ///     for x in IteratorSequence(i) { ... }
 @_fixed_layout
 public struct IteratorSequence<Base : IteratorProtocol> {
-  @_versioned
+  @usableFromInline
   internal var _base: Base
 
   /// Creates an instance whose iterator is a copy of `base`.
-  @_inlineable
+  @inlinable
   public init(_ base: Base) {
     _base = base
   }
@@ -1452,7 +1470,7 @@ extension IteratorSequence: IteratorProtocol, Sequence {
   ///
   /// - Precondition: `next()` has not been applied to a copy of `self`
   ///   since the copy was made.
-  @_inlineable
+  @inlinable
   public mutating func next() -> Base.Element? {
     return _base.next()
   }

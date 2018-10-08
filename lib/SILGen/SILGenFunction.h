@@ -22,6 +22,7 @@
 #include "SILGenBuilder.h"
 #include "swift/AST/AnyFunctionRef.h"
 #include "swift/Basic/ProfileCounter.h"
+#include "swift/Basic/Statistic.h"
 #include "swift/SIL/SILBuilder.h"
 #include "llvm/ADT/PointerIntPair.h"
 
@@ -38,11 +39,13 @@ class ConsumableManagedValue;
 class LogicalPathComponent;
 class LValue;
 class ManagedValue;
+class PreparedArguments;
 class RValue;
 class CalleeTypeInfo;
 class ResultPlan;
 using ResultPlanPtr = std::unique_ptr<ResultPlan>;
 class ArgumentScope;
+class Scope;
 
 enum class ApplyOptions : unsigned {
   /// No special treatment is required.
@@ -114,6 +117,94 @@ enum class CaptureEmission {
   PartialApplication,
 };
 
+/// Different ways in which an l-value can be emitted.
+enum class SGFAccessKind : uint8_t {
+  /// The access is a read whose result will be ignored.
+  IgnoredRead,
+
+  /// The access is a read that would prefer the address of a borrowed value.
+  /// This should only be used when it is semantically acceptable to borrow
+  /// the value, not just because the caller would benefit from a borrowed
+  /// value.  See shouldEmitSelfAsRValue.
+  ///
+  /// The caller will be calling emitAddressOfLValue or emitLoadOfLValue
+  /// on the l-value.  The latter may be less efficient than an access
+  /// would be if the l-value had been emitted with an owned-read kind.
+  BorrowedAddressRead,
+
+  /// The access is a read that would prefer a loaded borrowed value.
+  /// This should only be used when it is semantically acceptable to borrow
+  /// the value, not just because the caller would benefit from a borrowed
+  /// value.  See shouldEmitSelfAsRValue.
+  ///
+  /// There isn't yet a way to emit the access that takes advantage of this.
+  BorrowedObjectRead,
+
+  /// The access is a read that would prefer the address of an owned value.
+  ///
+  /// The caller will be calling emitAddressOfLValue or emitLoadOfLValue
+  /// on the l-value.
+  OwnedAddressRead,
+
+  /// The access is a read that would prefer a loaded owned value.
+  ///
+  /// The caller will be calling emitLoadOfLValue on the l-value.
+  OwnedObjectRead,
+
+  /// The access is an assignment (or maybe an initialization).
+  ///
+  /// The caller will be calling emitAssignToLValue on the l-value.
+  Write,
+
+  /// The access is a read-modify-write.
+  ///
+  /// The caller will be calling emitAddressOfLValue on the l-value.
+  ReadWrite
+};
+
+static inline bool isReadAccess(SGFAccessKind kind) {
+  return uint8_t(kind) <= uint8_t(SGFAccessKind::OwnedObjectRead);
+}
+
+/// Given a read access kind, does it require an owned result?
+static inline bool isReadAccessResultOwned(SGFAccessKind kind) {
+  assert(isReadAccess(kind));
+  return uint8_t(kind) >= uint8_t(SGFAccessKind::OwnedAddressRead);
+}
+
+/// Return an address-preferring version of the given access kind.
+static inline SGFAccessKind getAddressAccessKind(SGFAccessKind kind) {
+  switch (kind) {
+  case SGFAccessKind::BorrowedObjectRead:
+    return SGFAccessKind::BorrowedAddressRead;
+  case SGFAccessKind::OwnedObjectRead:
+    return SGFAccessKind::OwnedAddressRead;
+  case SGFAccessKind::IgnoredRead:
+  case SGFAccessKind::BorrowedAddressRead:
+  case SGFAccessKind::OwnedAddressRead:
+  case SGFAccessKind::Write:
+  case SGFAccessKind::ReadWrite:
+    return kind;
+  }
+  llvm_unreachable("bad kind");
+}
+
+static inline AccessKind getFormalAccessKind(SGFAccessKind kind) {
+  switch (kind) {
+  case SGFAccessKind::IgnoredRead:
+  case SGFAccessKind::BorrowedAddressRead:
+  case SGFAccessKind::BorrowedObjectRead:
+  case SGFAccessKind::OwnedAddressRead:
+  case SGFAccessKind::OwnedObjectRead:
+    return AccessKind::Read;
+  case SGFAccessKind::Write:
+    return AccessKind::Write;
+  case SGFAccessKind::ReadWrite:
+    return AccessKind::ReadWrite;
+  }
+  llvm_unreachable("bad kind");
+}
+
 /// Parameter to \c SILGenFunction::emitAddressOfLValue that indicates
 /// what kind of instrumentation should be emitted when compiling under
 /// Thread Sanitizer.
@@ -126,8 +217,7 @@ enum class TSanKind : bool {
 
 /// Represents an LValue opened for mutating access.
 ///
-/// This is used by LogicalPathComponent::getMaterialized() and
-/// SILGenFunction::emitMaterializeForSetAccessor().
+/// This is used by LogicalPathComponent::projectAsBase().
 struct MaterializedLValue {
   ManagedValue temporary;
 
@@ -165,6 +255,9 @@ public:
 
   /// The SILModuleConventions for this SIL module.
   SILModuleConventions silConv;
+
+  /// The DeclContext corresponding to the function currently being emitted.
+  DeclContext * const FunctionDC;
 
   /// The name of the function currently being emitted, as presented to user
   /// code by #function.
@@ -236,6 +329,10 @@ public:
   /// The destination for throws.  The block will always be in the
   /// postmatter and takes a BB argument of the exception type.
   JumpDest ThrowDest = JumpDest::invalid();
+
+  /// The destination for coroutine unwinds.  The block will always
+  /// be in the postmatter.
+  JumpDest CoroutineUnwindDest = JumpDest::invalid();
     
   /// \brief The SIL location corresponding to the AST node being processed.
   SILLocation CurrentSILLoc;
@@ -245,16 +342,6 @@ public:
 
   /// \brief The current context where formal evaluation cleanups are managed.
   FormalEvaluationContext FormalEvalContext;
-
-  /// \brief Values to end dynamic access enforcement on.  A hack for
-  /// materializeForSet.
-  struct UnpairedAccesses {
-    SILValue Buffer;
-    unsigned NumAccesses = 0; // Values besides 0 and 1 are unsupported.
-
-    explicit UnpairedAccesses(SILValue buffer) : Buffer(buffer) {}
-  };
-  UnpairedAccesses *UnpairedAccessesForMaterializeForSet = nullptr;
 
   /// VarLoc - representation of an emitted local variable or constant.  There
   /// are three scenarios here:
@@ -370,13 +457,19 @@ public:
   bool allowsVoidReturn() const { return ReturnDest.getBlock()->args_empty(); }
 
   /// Emit code to increment a counter for profiling.
-  void emitProfilerIncrement(ASTNode N) {
-    if (SGM.Profiler && SGM.Profiler->hasRegionCounters() &&
-        SGM.M.getOptions().UseProfile.empty())
-      SGM.Profiler->emitCounterIncrement(B, N);
-  }
+  void emitProfilerIncrement(ASTNode Node);
 
-  SILGenFunction(SILGenModule &SGM, SILFunction &F);
+  /// Load the profiled execution count corresponding to \p Node, if one is
+  /// available.
+  ProfileCounter loadProfilerCount(ASTNode Node) const;
+
+  /// Get the PGO node's parent.
+  Optional<ASTNode> getPGOParent(ASTNode Node) const;
+
+  /// Tracer object for counting SIL (and other events) caused by this instance.
+  FrontendStatsTracer StatsTracer;
+
+  SILGenFunction(SILGenModule &SGM, SILFunction &F, DeclContext *DC);
   ~SILGenFunction();
   
   /// Return a stable reference to the current cleanup.
@@ -437,7 +530,8 @@ public:
   void enterDebugScope(SILLocation Loc) {
     auto *Parent =
         DebugScopeStack.size() ? DebugScopeStack.back() : F.getDebugScope();
-    auto *DS = new (SGM.M) SILDebugScope(Loc, &getFunction(), Parent);
+    auto *DS = new (SGM.M)
+        SILDebugScope(Loc.getAsRegularLocation(), &getFunction(), Parent);
     DebugScopeStack.push_back(DS);
     B.setCurrentDebugScope(DS);
   }
@@ -518,8 +612,6 @@ public:
   void emitForeignToNativeThunk(SILDeclRef thunk);
   /// Generates a thunk from a native function to the conventions.
   void emitNativeToForeignThunk(SILDeclRef thunk);
-  /// Generates a resilient method dispatch thunk.
-  void emitDispatchThunk(SILDeclRef constant);
   
   /// Generate a nullary function that returns the given value.
   void emitGeneratorFunction(SILDeclRef function, Expr *value);
@@ -539,21 +631,17 @@ public:
                           SILGlobalVariable *onceToken,
                           SILFunction *onceFunc);
 
-  void emitGlobalGetter(VarDecl *global,
-                        SILGlobalVariable *onceToken,
-                        SILFunction *onceFunc);
-  
   /// Generate a protocol witness entry point, invoking 'witness' at the
   /// abstraction level of 'requirement'.
   ///
   /// This is used for both concrete witness thunks and default witness
   /// thunks.
-  void emitProtocolWitness(Type selfType,
-                           AbstractionPattern reqtOrigTy,
+  void emitProtocolWitness(AbstractionPattern reqtOrigTy,
                            CanAnyFunctionType reqtSubstTy,
                            SILDeclRef requirement,
+                           SubstitutionMap reqtSubs,
                            SILDeclRef witness,
-                           SubstitutionList witnessSubs,
+                           SubstitutionMap witnessSubs,
                            IsFreeFunctionWitness_t isFree);
   
   /// Convert a block to a native function with a thunk.
@@ -569,7 +657,13 @@ public:
                                CanAnyFunctionType funcTy,
                                CanAnyFunctionType blockTy,
                                CanSILFunctionType loweredBlockTy);
-  
+
+  /// Given a non-canonical function type, create a thunk for the function's
+  /// canonical type.
+  ManagedValue emitCanonicalFunctionThunk(SILLocation loc, ManagedValue fn,
+                                          CanSILFunctionType nonCanonicalTy,
+                                          CanSILFunctionType canonicalTy);
+
   /// Thunk with the signature of a base class method calling a derived class
   /// method.
   ///
@@ -625,7 +719,9 @@ public:
   /// first block.  (This is clearly desirable behavior when blocks
   /// are created by different emissions; it's just a little
   /// counter-intuitive within a single emission.)
-  SILBasicBlock *createBasicBlock(SILBasicBlock *afterBB = nullptr);  
+  SILBasicBlock *createBasicBlock();
+  SILBasicBlock *createBasicBlockAfter(SILBasicBlock *afterBB);
+  SILBasicBlock *createBasicBlockBefore(SILBasicBlock *beforeBB);
 
   /// Create a new basic block at the end of the given function
   /// section.
@@ -650,14 +746,19 @@ public:
   /// emitProlog - Generates prolog code to allocate and clean up mutable
   /// storage for closure captures and local arguments.
   void emitProlog(AnyFunctionRef TheClosure,
-                  ArrayRef<ParameterList *> paramPatterns, Type resultType,
-                  bool throws);
+                  ParameterList *paramList, ParamDecl *selfParam,
+                  Type resultType, bool throws);
   /// returns the number of variables in paramPatterns.
-  unsigned emitProlog(ArrayRef<ParameterList *> paramPatterns, Type resultType,
-                      DeclContext *DeclCtx, bool throws);
+  uint16_t emitProlog(ParameterList *paramList, ParamDecl *selfParam,
+                      Type resultType, DeclContext *DeclCtx, bool throws);
+
+  /// Create SILArguments in the entry block that bind a single value
+  /// of the given parameter suitably for being forwarded.
+  void bindParameterForForwarding(ParamDecl *param,
+                                  SmallVectorImpl<SILValue> &parameters);
 
   /// Create SILArguments in the entry block that bind all the values
-  /// of the given pattern suitably for being forwarded.
+  /// of the given parameter list suitably for being forwarded.
   void bindParametersForForwarding(const ParameterList *params,
                                    SmallVectorImpl<SILValue> &parameters);
 
@@ -672,6 +773,7 @@ public:
   ///                    cleanup instructions.
   void prepareEpilog(Type returnType, bool isThrowing, CleanupLocation L);
   void prepareRethrowEpilog(CleanupLocation l);
+  void prepareCoroutineUnwindEpilog(CleanupLocation l);
   
   /// \brief Branch to and emit the epilog basic block. This will fuse
   /// the epilog to the current basic block if the epilog bb has no predecessor.
@@ -706,6 +808,9 @@ public:
 
   /// \brief Emits the standard rethrow epilog using a Swift error result.
   void emitRethrowEpilog(SILLocation topLevelLoc);
+
+  /// \brief Emits the coroutine-unwind epilog.
+  void emitCoroutineUnwindEpilog(SILLocation topLevelLoc);
 
   /// emitSelfDecl - Emit a SILArgument for 'self', register it in varlocs, set
   /// up debug info, etc.  This returns the 'self' value.
@@ -803,13 +908,15 @@ public:
   /// _diagnoseUnexpectedNilOptional if the optional has no value. Return the
   /// MangedValue resulting from the success case.
   ManagedValue emitPreconditionOptionalHasValue(SILLocation loc,
-                                                ManagedValue optional);
+                                                ManagedValue optional,
+                                                bool isImplicitUnwrap);
 
   /// \brief Emit a call to the library intrinsic _getOptionalValue
   /// given the address of the optional, which checks that an optional contains
   /// some value and either returns the value or traps if there is none.
   ManagedValue emitCheckedGetOptionalValueFrom(SILLocation loc,
                                                ManagedValue addr,
+                                               bool isImplicitUnwrap,
                                                const TypeLowering &optTL,
                                                SGFContext C);
   
@@ -1044,22 +1151,22 @@ public:
   
   /// Returns a reference to a function value that dynamically dispatches
   /// the function in a runtime-modifiable way.
-  SILValue emitDynamicMethodRef(SILLocation loc, SILDeclRef constant,
-                                CanSILFunctionType constantTy);
+  ManagedValue emitDynamicMethodRef(SILLocation loc, SILDeclRef constant,
+                                    CanSILFunctionType constantTy);
 
   /// Returns a reference to a vtable-dispatched method.
   SILValue emitClassMethodRef(SILLocation loc, SILValue selfPtr,
                               SILDeclRef constant,
                               CanSILFunctionType constantTy);
 
-  /// Emit the specified VarDecl as an LValue if possible, otherwise return
-  /// null.
-  ManagedValue emitLValueForDecl(SILLocation loc, VarDecl *var,
-                                 CanType formalRValueType,
-                                 AccessKind accessKind,
-                                 AccessSemantics semantics
-                                   = AccessSemantics::Ordinary);
-  
+  /// Given that a variable is a local stored variable, return its address.
+  ManagedValue emitAddressOfLocalVarDecl(SILLocation loc, VarDecl *var,
+                                         CanType formalRValueType,
+                                         SGFAccessKind accessKind);
+
+  // FIXME: demote this to private state.
+  ManagedValue maybeEmitValueOfLocalVarDecl(VarDecl *var);
+
   /// Produce an RValue for a reference to the specified declaration,
   /// with the given type and in response to the specified expression.  Try to
   /// emit into the specified SGFContext to avoid copies (when provided).
@@ -1079,8 +1186,8 @@ public:
                                   ManagedValue base,
                                   CanType baseFormalType,
                                   bool isSuper, AbstractStorageDecl *storage,
-                                  RValue indexes,
-                                  SubstitutionList substitutions,
+                                  PreparedArguments &&indices,
+                                  SubstitutionMap substitutions,
                                   AccessSemantics semantics, Type propTy,
                                   SGFContext C,
                                   bool isBaseGuaranteed = false);
@@ -1096,56 +1203,53 @@ public:
   ManagedValue emitClosureValue(SILLocation loc,
                                 SILDeclRef function,
                                 CanType expectedType,
-                                SubstitutionList subs);
-  
+                                SubstitutionMap subs);
+
+  PreparedArguments prepareSubscriptIndices(SubscriptDecl *subscript,
+                                            SubstitutionMap subs,
+                                            AccessStrategy strategy,
+                                            Expr *indices);
+
   ArgumentSource prepareAccessorBaseArg(SILLocation loc, ManagedValue base,
                                         CanType baseFormalType,
                                         SILDeclRef accessor);
 
-  SILDeclRef getGetterDeclRef(AbstractStorageDecl *decl,
-                              bool isDirectAccessorUse);  
   RValue emitGetAccessor(SILLocation loc, SILDeclRef getter,
-                         SubstitutionList substitutions,
+                         SubstitutionMap substitutions,
                          ArgumentSource &&optionalSelfValue,
                          bool isSuper, bool isDirectAccessorUse,
-                         RValue &&optionalSubscripts, SGFContext C);
+                         PreparedArguments &&optionalSubscripts, SGFContext C);
 
-  SILDeclRef getSetterDeclRef(AbstractStorageDecl *decl,
-                              bool isDirectAccessorUse);  
   void emitSetAccessor(SILLocation loc, SILDeclRef setter,
-                       SubstitutionList substitutions,
+                       SubstitutionMap substitutions,
                        ArgumentSource &&optionalSelfValue,
                        bool isSuper, bool isDirectAccessorUse,
-                       RValue &&optionalSubscripts,
+                       PreparedArguments &&optionalSubscripts,
                        ArgumentSource &&value);
 
-  SILDeclRef getMaterializeForSetDeclRef(AbstractStorageDecl *decl,
-                                         bool isDirectAccessorUse);  
-  MaterializedLValue
-  emitMaterializeForSetAccessor(SILLocation loc, SILDeclRef materializeForSet,
-                                SubstitutionList substitutions,
-                                ArgumentSource &&optionalSelfValue,
-                                bool isSuper, bool isDirectAccessorUse,
-                                RValue &&optionalSubscripts,
-                                SILValue buffer, SILValue callbackStorage);
   bool maybeEmitMaterializeForSetThunk(ProtocolConformanceRef conformance,
                                        SILLinkage linkage,
                                        Type selfInterfaceType, Type selfType,
                                        GenericEnvironment *genericEnv,
-                                       FuncDecl *requirement, FuncDecl *witness,
-                                       SubstitutionList witnessSubs);
-  void emitMaterializeForSet(FuncDecl *decl);
+                                       AccessorDecl *requirement,
+                                       AccessorDecl *witness,
+                                       SubstitutionMap witnessSubs);
 
-  SILDeclRef getAddressorDeclRef(AbstractStorageDecl *decl,
-                                 AccessKind accessKind,
-                                 bool isDirectAccessorUse);
   std::pair<ManagedValue,ManagedValue>
   emitAddressorAccessor(SILLocation loc, SILDeclRef addressor,
-                        SubstitutionList substitutions,
+                        SubstitutionMap substitutions,
                         ArgumentSource &&optionalSelfValue,
                         bool isSuper, bool isDirectAccessorUse,
-                        RValue &&optionalSubscripts,
+                        PreparedArguments &&optionalSubscripts,
                         SILType addressType);
+
+  CleanupHandle
+  emitCoroutineAccessor(SILLocation loc, SILDeclRef accessor,
+                        SubstitutionMap substitutions,
+                        ArgumentSource &&optionalSelfValue,
+                        bool isSuper, bool isDirectAccessorUse,
+                        PreparedArguments &&optionalSubscripts,
+                        SmallVectorImpl<ManagedValue> &yields);
 
   RValue emitApplyConversionFunction(SILLocation loc,
                                      Expr *funcExpr,
@@ -1178,7 +1282,7 @@ public:
                                                     SILValue borrowedValue);
   ManagedValue emitManagedBorrowedRValueWithCleanup(
       SILValue original, SILValue borrowedValue, const TypeLowering &lowering);
-  ManagedValue emitManagedBorrowedArgumentWithCleanup(SILPHIArgument *arg);
+  ManagedValue emitManagedBorrowedArgumentWithCleanup(SILPhiArgument *arg);
   ManagedValue emitFormalEvaluationManagedBorrowedRValueWithCleanup(
       SILLocation loc, SILValue original, SILValue borrowedValue);
   ManagedValue emitFormalEvaluationManagedBorrowedRValueWithCleanup(
@@ -1264,13 +1368,12 @@ public:
   void emitCopyLValueInto(SILLocation loc, LValue &&src,
                           Initialization *dest);
   ManagedValue emitAddressOfLValue(SILLocation loc, LValue &&src,
-                                   AccessKind accessKind,
                                    TSanKind tsanKind = TSanKind::None);
   LValue emitOpenExistentialLValue(SILLocation loc,
                                    LValue &&existentialLV,
                                    CanArchetypeType openedArchetype,
                                    CanType formalRValueType,
-                                   AccessKind accessKind);
+                                   SGFAccessKind accessKind);
 
   RValue emitLoadOfLValue(SILLocation loc, LValue &&src, SGFContext C,
                           bool isBaseLValueGuaranteed = false);
@@ -1280,11 +1383,17 @@ public:
   emitSiblingMethodRef(SILLocation loc,
                        SILValue selfValue,
                        SILDeclRef methodConstant,
-                       const SubstitutionMap &subMap);
+                       SubstitutionMap subMap);
   
   SILValue emitMetatypeOfValue(SILLocation loc, Expr *baseExpr);
   
   void emitReturnExpr(SILLocation loc, Expr *ret);
+
+  void emitYield(SILLocation loc, MutableArrayRef<ArgumentSource> yieldValues,
+                 ArrayRef<AbstractionPattern> origTypes,
+                 JumpDest unwindDest);
+  void emitRawYield(SILLocation loc, ArrayRef<ManagedValue> yieldArgs,
+                    JumpDest unwindDest, bool isUniqueYield);
 
   RValue emitAnyHashableErasure(SILLocation loc,
                                 ManagedValue value,
@@ -1299,7 +1408,7 @@ public:
   //
   // Helpers for emitting ApplyExpr chains.
   //
-  
+
   RValue emitApplyExpr(Expr *e, SGFContext c);
 
   /// Emit a function application, assuming that the arguments have been
@@ -1307,7 +1416,7 @@ public:
   /// result does need to be turned back into something matching a
   /// formal type.
   RValue emitApply(ResultPlanPtr &&resultPlan, ArgumentScope &&argScope,
-                   SILLocation loc, ManagedValue fn, SubstitutionList subs,
+                   SILLocation loc, ManagedValue fn, SubstitutionMap subs,
                    ArrayRef<ManagedValue> args,
                    const CalleeTypeInfo &calleeTypeInfo, ApplyOptions options,
                    SGFContext evalContext);
@@ -1322,7 +1431,7 @@ public:
   RValue emitApplyOfStoredPropertyInitializer(
       SILLocation loc,
       const PatternBindingEntry &entry,
-      SubstitutionList subs,
+      SubstitutionMap subs,
       CanType resultType,
       AbstractionPattern origResultType,
       SGFContext C);
@@ -1341,20 +1450,21 @@ public:
 
   RValue emitApplyOfLibraryIntrinsic(SILLocation loc,
                                      FuncDecl *fn,
-                                     const SubstitutionMap &subMap,
-                                     ArrayRef<ManagedValue> args,
-                                     SGFContext ctx);
-
-  RValue emitApplyOfLibraryIntrinsic(SILLocation loc,
-                                     FuncDecl *fn,
-                                     const SubstitutionList &subs,
+                                     SubstitutionMap subMap,
                                      ArrayRef<ManagedValue> args,
                                      SGFContext ctx);
 
   SILValue emitApplyWithRethrow(SILLocation loc, SILValue fn,
                                 SILType substFnType,
-                                SubstitutionList subs,
+                                SubstitutionMap subs,
                                 ArrayRef<SILValue> args);
+
+  SILValue emitBeginApplyWithRethrow(SILLocation loc, SILValue fn,
+                                     SILType substFnType,
+                                     SubstitutionMap subs,
+                                     ArrayRef<SILValue> args,
+                                     SmallVectorImpl<SILValue> &yields);
+  void emitEndApplyWithRethrow(SILLocation loc, SILValue token);
 
   /// Emit a literal that applies the various initializers.
   RValue emitLiteral(LiteralExpr *literal, SGFContext C);
@@ -1456,26 +1566,13 @@ public:
   ///                     terminated.
   /// \param handleFalse  A callback to invoke in the failure path.  The
   ///                     current BB should be terminated.
-  void
-  emitCheckedCastBranch(SILLocation loc, ConsumableManagedValue src,
-                        Type sourceType, CanType targetType, SGFContext C,
-                        std::function<void(ManagedValue)> handleTrue,
-                        std::function<void(Optional<ManagedValue>)> handleFalse,
-                        ProfileCounter TrueCount = ProfileCounter(),
-                        ProfileCounter FalseCount = ProfileCounter());
-
-  /// A form of checked cast branch that uses the old non-ownership preserving
-  /// semantics.
-  ///
-  /// The main difference is that this code does not pass the old argument as a
-  /// block argument in the failure case. This causes values to be double
-  /// consumed.
-  void emitCheckedCastBranchOld(SILLocation loc, Expr *source, Type targetType,
-                                SGFContext ctx,
-                                std::function<void(ManagedValue)> handleTrue,
-                                std::function<void()> handleFalse,
-                                ProfileCounter TrueCount = ProfileCounter(),
-                                ProfileCounter FalseCount = ProfileCounter());
+  void emitCheckedCastBranch(
+      SILLocation loc, ConsumableManagedValue src, Type sourceType,
+      CanType targetType, SGFContext C,
+      llvm::function_ref<void(ManagedValue)> handleTrue,
+      llvm::function_ref<void(Optional<ManagedValue>)> handleFalse,
+      ProfileCounter TrueCount = ProfileCounter(),
+      ProfileCounter FalseCount = ProfileCounter());
 
   /// \brief Emit a conditional checked cast branch, starting from an
   /// expression.  Terminates the current BB.
@@ -1489,36 +1586,29 @@ public:
   ///                     terminated.
   /// \param handleFalse  A callback to invoke in the failure path.  The
   ///                     current BB should be terminated.
-  void
-  emitCheckedCastBranch(SILLocation loc, Expr *src, Type targetType,
-                        SGFContext C,
-                        std::function<void(ManagedValue)> handleTrue,
-                        std::function<void(Optional<ManagedValue>)> handleFalse,
-                        ProfileCounter TrueCount = ProfileCounter(),
-                        ProfileCounter FalseCount = ProfileCounter());
-
-  /// A form of checked cast branch that uses the old non-ownership preserving
-  /// semantics.
-  ///
-  /// The main difference is that this code does not pass the old argument as a
-  /// block argument in the failure case. This causes values to be double
-  /// consumed.
-  void emitCheckedCastBranchOld(SILLocation loc, ConsumableManagedValue src,
-                                Type sourceType, CanType targetType,
-                                SGFContext ctx,
-                                std::function<void(ManagedValue)> handleTrue,
-                                std::function<void()> handleFalse,
-                                ProfileCounter TrueCount = ProfileCounter(),
-                                ProfileCounter FalseCount = ProfileCounter());
+  void emitCheckedCastBranch(
+      SILLocation loc, Expr *src, Type targetType, SGFContext C,
+      llvm::function_ref<void(ManagedValue)> handleTrue,
+      llvm::function_ref<void(Optional<ManagedValue>)> handleFalse,
+      ProfileCounter TrueCount = ProfileCounter(),
+      ProfileCounter FalseCount = ProfileCounter());
 
   /// Emit the control flow for an optional 'bind' operation, branching to the
   /// active failure destination if the optional value addressed by optionalAddr
   /// is nil, and leaving the insertion point on the success branch.
   ///
-  /// NOTE: This operation does *not* consume the managed value.
+  /// NOTE: This operation does consume the managed value.
+  ManagedValue emitBindOptional(SILLocation loc,
+                                ManagedValue optionalAddrOrValue,
+                                unsigned depth);
+
+  /// Emit the control flow for an optional 'bind' operation, branching to the
+  /// active failure destination if the optional value addressed by optionalAddr
+  /// is nil, and leaving the insertion point on the success branch.
   ///
-  void emitBindOptional(SILLocation loc, ManagedValue optionalAddrOrValue,
-                        unsigned depth);
+  /// NOTE: This operation does not consume the managed address.
+  void emitBindOptionalAddress(SILLocation loc, ManagedValue optionalAddr,
+                               unsigned depth);
 
   void emitOptionalEvaluation(SILLocation loc, Type optionalType,
                               SmallVectorImpl<ManagedValue> &results,
@@ -1630,10 +1720,10 @@ public:
                               CanType outputSubstType,
                               SGFContext ctx = SGFContext());
 
-  /// Used for emitting SILArguments of bare functions, such as thunks and
-  /// open-coded materializeForSet.
-  void collectThunkParams(SILLocation loc,
-                          SmallVectorImpl<ManagedValue> &params);
+  /// Used for emitting SILArguments of bare functions, such as thunks.
+  void collectThunkParams(
+      SILLocation loc, SmallVectorImpl<ManagedValue> &params,
+      SmallVectorImpl<SILArgument *> *indirectResultParams = nullptr);
 
   /// Build the type of a function transformation thunk.
   CanSILFunctionType buildThunkType(CanSILFunctionType &sourceType,
@@ -1641,7 +1731,16 @@ public:
                                     CanType &inputSubstType,
                                     CanType &outputSubstType,
                                     GenericEnvironment *&genericEnv,
-                                    SubstitutionMap &interfaceSubs);
+                                    SubstitutionMap &interfaceSubs,
+                                    bool withoutActuallyEscaping=false);
+
+  //===--------------------------------------------------------------------===//
+  // NoEscaping to Escaping closure thunk
+  //===--------------------------------------------------------------------===//
+  ManagedValue
+  createWithoutActuallyEscapingClosure(SILLocation loc,
+                                       ManagedValue noEscapingFunctionValue,
+                                       SILType escapingFnTy);
 
   //===--------------------------------------------------------------------===//
   // Declarations
@@ -1671,6 +1770,10 @@ public:
     // No lowering support needed.
   }
   void visitAssociatedTypeDecl(AssociatedTypeDecl *D) {
+    // No lowering support needed.
+  }
+
+  void visitPoundDiagnosticDecl(PoundDiagnosticDecl *D) {
     // No lowering support needed.
   }
 
@@ -1740,31 +1843,32 @@ public:
   
   /// Enter a cleanup to emit a DeinitExistentialAddr or DeinitExistentialBox
   /// of the specified value.
-  CleanupHandle enterDeinitExistentialCleanup(SILValue valueOrAddr,
+  CleanupHandle enterDeinitExistentialCleanup(CleanupState state,
+                                              SILValue addr,
                                               CanType concreteFormalType,
                                               ExistentialRepresentation repr);
 
   /// Evaluate an Expr as an lvalue.
-  LValue emitLValue(Expr *E, AccessKind accessKind,
+  LValue emitLValue(Expr *E, SGFAccessKind accessKind,
                     LValueOptions options = LValueOptions());
 
-  /// Emit a reference to a variable as an lvalue.
-  LValue emitLValueForAddressedNonMemberVarDecl(SILLocation loc, VarDecl *var,
-                                                CanType formalRValueType,
-                                                AccessKind accessKind,
-                                                AccessSemantics semantics);
+  RValue emitRValueForNonMemberVarDecl(SILLocation loc, VarDecl *var,
+                                       CanType formalRValueType,
+                                       AccessSemantics semantics,
+                                       SGFContext C);
 
   /// Emit an lvalue that directly refers to the given instance variable
   /// (without going through getters or setters).
   LValue emitPropertyLValue(SILLocation loc, ManagedValue base,
                             CanType baseFormalType, VarDecl *var,
                             LValueOptions options,
-                            AccessKind accessKind, AccessSemantics semantics);
+                            SGFAccessKind accessKind,
+                            AccessSemantics semantics);
 
   struct PointerAccessInfo {
     CanType PointerType;
     PointerTypeKind PointerKind;
-    swift::AccessKind AccessKind;
+    SGFAccessKind AccessKind;
   };
 
   PointerAccessInfo getPointerAccessInfo(Type pointerType);
@@ -1774,7 +1878,7 @@ public:
   struct ArrayAccessInfo {
     Type PointerType;
     Type ArrayType;
-    swift::AccessKind AccessKind;
+    SGFAccessKind AccessKind;
   };
   ArrayAccessInfo getArrayAccessInfo(Type pointerType, Type arrayType);
   std::pair<ManagedValue,ManagedValue>
@@ -1791,11 +1895,11 @@ public:
 
   class ForceTryEmission {
     SILGenFunction &SGF;
-    Expr *Loc;
+    ForceTryExpr *Loc;
     JumpDest OldThrowDest;
 
   public:
-    ForceTryEmission(SILGenFunction &SGF, Expr *loc);
+    ForceTryEmission(SILGenFunction &SGF, ForceTryExpr *loc);
 
     ForceTryEmission(const ForceTryEmission &) = delete;
     ForceTryEmission &operator=(const ForceTryEmission &) = delete;
@@ -1809,8 +1913,8 @@ public:
 
   /// Return forwarding substitutions for the archetypes in the current
   /// function.
-  SubstitutionList getForwardingSubstitutions();
-  
+  SubstitutionMap getForwardingSubstitutionMap();
+
   /// Get the _Pointer protocol used for pointer argument operations.
   ProtocolDecl *getPointerProtocol();
 };

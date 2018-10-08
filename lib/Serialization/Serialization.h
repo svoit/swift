@@ -32,7 +32,7 @@ namespace swift {
 
 namespace serialization {
 
-typedef ArrayRef<std::string> FilenamesTy;
+using FilenamesTy = ArrayRef<std::string>;
 
 class Serializer {
   SmallVector<char, 0> Buffer;
@@ -83,15 +83,21 @@ public:
     }
   };
 
-  // FIXME: This should be a PointerIntPair, but there's a bug in
-  // PointerIntPair when the number of free bits is greater than 32.
-  using DeclIDAndForce = std::pair<DeclID, bool>;
-
 private:
   /// A map from Types and Decls to their serialized IDs.
-  llvm::DenseMap<DeclTypeUnion, DeclIDAndForce> DeclAndTypeIDs;
+  llvm::DenseMap<DeclTypeUnion, DeclID> DeclAndTypeIDs;
+
+  /// A map from non-identifier uniqued strings to their serialized IDs.
+  ///
+  /// Since we never remove items from this map, we can use a BumpPtrAllocator
+  /// to back the entries.
+  llvm::StringMap<IdentifierID, llvm::BumpPtrAllocator> UniquedStringIDs;
 
   /// A map from Identifiers to their serialized IDs.
+  ///
+  /// This is stored separately from \p UniquedStringIDs because it's faster
+  /// to do lookups in, even though that may lead to some duplication between
+  /// identifier and non-identifier strings.
   llvm::DenseMap<Identifier, IdentifierID> IdentifierIDs;
 
   /// A map from DeclContexts to their serialized IDs.
@@ -107,6 +113,9 @@ private:
   /// A map from generic environments to their serialized IDs.
   llvm::DenseMap<const GenericEnvironment *, GenericEnvironmentID>
     GenericEnvironmentIDs;
+
+  /// A map from substitution maps to their serialized IDs.
+  llvm::DenseMap<SubstitutionMap, SubstitutionMapID> SubstitutionMapIDs;
 
   // A map from NormalProtocolConformances to their serialized IDs.
   llvm::DenseMap<const NormalProtocolConformance *, NormalConformanceID>
@@ -177,14 +186,18 @@ private:
   /// Generic environments that need to be serialized.
   std::queue<const GenericEnvironment*> GenericEnvironmentsToWrite;
 
+  /// Substitution maps that need to be serialized.
+  std::queue<SubstitutionMap> SubstitutionMapsToWrite;
+
   /// NormalProtocolConformances that need to be serialized.
   std::queue<const NormalProtocolConformance *> NormalConformancesToWrite;
 
   /// SILLayouts that need to be serialized.
   std::queue<SILLayout *> SILLayoutsToWrite;
 
-  /// All identifiers that need to be serialized.
-  std::vector<Identifier> IdentifiersToWrite;
+  /// All uniqued strings that need to be serialized (identifiers and
+  /// non-identifiers).
+  std::vector<StringRef> StringsToWrite;
 
   /// The abbreviation code for each record in the "decls-and-types" block.
   ///
@@ -217,6 +230,10 @@ private:
   /// GenericEnvironmentID.
   std::vector<BitOffset> GenericEnvironmentOffsets;
 
+  /// The offset of each SubstitutionMap in the bitstream, indexed by
+  /// SubstitutionMapID.
+  std::vector<BitOffset> SubstitutionMapOffsets;
+
   /// The offset of each NormalProtocolConformance in the bitstream, indexed by
   /// NormalConformanceID.
   std::vector<BitOffset> NormalConformanceOffsets;
@@ -246,11 +263,11 @@ private:
   /// The last assigned DeclID for types from this module.
   uint32_t /*TypeID*/ LastTypeID = 0;
 
-  /// The last assigned IdentifierID for types from this module.
+  /// The last assigned IdentifierID for uniqued strings from this module.
   ///
   /// Note that special module IDs and IDs of special names must not be valid
   /// IdentifierIDs, except that 0 will always represent the empty identifier.
-  uint32_t /*IdentifierID*/ LastIdentifierID =
+  uint32_t /*IdentifierID*/ LastUniquedStringID =
       serialization::NUM_SPECIAL_IDS - 1;
 
   /// The last assigned GenericSignatureID for generic signature from this
@@ -260,6 +277,10 @@ private:
   /// The last assigned GenericEnvironmentID for generic environments from this
   /// module.
   uint32_t /*GenericEnvironmentID*/ LastGenericEnvironmentID = 0;
+
+  /// The last assigned SubstitutionMapID for substitution maps from this
+  /// module.
+  uint32_t /*SubstitutionMapID*/ LastSubstitutionMapID = 0;
 
   /// Returns the record code for serializing the given vector of offsets.
   ///
@@ -280,6 +301,8 @@ private:
       return index_block::GENERIC_SIGNATURE_OFFSETS;
     if (&values == &GenericEnvironmentOffsets)
       return index_block::GENERIC_ENVIRONMENT_OFFSETS;
+    if (&values == &SubstitutionMapOffsets)
+      return index_block::SUBSTITUTION_MAP_OFFSETS;
     if (&values == &NormalConformanceOffsets)
       return index_block::NORMAL_CONFORMANCE_OFFSETS;
     if (&values == &SILLayoutOffsets)
@@ -311,6 +334,10 @@ private:
 
   /// Writes a generic parameter list.
   bool writeGenericParams(const GenericParamList *genericParams);
+
+  /// Writes the body text of the provided funciton, if the function is
+  /// inlinable and has body text.
+  void writeInlinableBodyTextIfNeeded(const AbstractFunctionDecl *decl);
 
   /// Writes a list of protocol conformances.
   void writeConformances(ArrayRef<ProtocolConformanceRef> conformances,
@@ -377,6 +404,9 @@ private:
   /// Writes a generic environment.
   void writeGenericEnvironment(const GenericEnvironment *env);
 
+  /// Writes a substitution map.
+  void writeSubstitutionMap(const SubstitutionMap substitutions);
+
   /// Registers the abbreviation for the given decl or type layout.
   template <typename Layout>
   void registerDeclTypeAbbr() {
@@ -438,13 +468,29 @@ public:
   /// \returns The ID for the given DeclBaseName in this module.
   IdentifierID addDeclBaseNameRef(DeclBaseName ident);
 
+  /// Records the use of the given string, which will only be stored once in
+  /// the resulting module file.
+  ///
+  /// \returns A pair containing the copy of the string now owned by the
+  /// Serializer and the ID for the string in this module.
+  /// \sa addUniquedStringRef
+  std::pair<StringRef, IdentifierID> addUniquedString(StringRef str);
+
+  /// Records the use of the given string, which will only be stored once in
+  /// the resulting module file.
+  ///
+  /// \returns The ID for the given string in this module.
+  /// \sa addUniquedString
+  IdentifierID addUniquedStringRef(StringRef str) {
+    return addUniquedString(str).second;
+  }
+
   /// Records the use of the given Decl.
   ///
   /// The Decl will be scheduled for serialization if necessary.
   ///
   /// \returns The ID for the given Decl in this module.
-  DeclID addDeclRef(const Decl *D, bool forceSerialization = false,
-                    bool allowTypeAliasXRef = false);
+  DeclID addDeclRef(const Decl *D, bool allowTypeAliasXRef = false);
 
   /// Records the use of the given DeclContext.
   ///
@@ -466,6 +512,11 @@ public:
   /// The GenericEnvironment will be scheduled for serialization if necessary.
   GenericEnvironmentID addGenericEnvironmentRef(const GenericEnvironment *env);
 
+  /// Records the use of the given substitution map.
+  ///
+  /// The SubstitutionMap will be scheduled for serialization if necessary.
+  SubstitutionMapID addSubstitutionMapRef(SubstitutionMap substitutions);
+
   /// Records the use of the given normal protocol conformance.
   ///
   /// The normal protocol conformance will be scheduled for
@@ -485,17 +536,6 @@ public:
   /// \returns The ID for the identifier for the module's name, or one of the
   /// special module codes defined above.
   IdentifierID addModuleRef(const ModuleDecl *M);
-
-  /// Writes a list of generic substitutions. abbrCode is needed to support
-  /// usage out of decl block.
-  ///
-  /// \param genericEnv When provided, the generic environment that describes
-  /// the archetypes within the substitutions. The replacement types within
-  /// the substitution will be mapped out of the generic environment before
-  /// being written.
-  void writeSubstitutions(SubstitutionList substitutions,
-                          const std::array<unsigned, 256> &abbrCodes,
-                          GenericEnvironment *genericEnv = nullptr);
 
   /// Write a normal protocol conformance.
   void writeNormalConformance(const NormalProtocolConformance *conformance);

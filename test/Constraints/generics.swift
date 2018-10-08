@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift
+// RUN: %target-typecheck-verify-swift -enable-objc-interop
 
 infix operator +++
 
@@ -188,7 +188,7 @@ func r22459135() {
 
 // <rdar://problem/19710848> QoI: Friendlier error message for "[] as Set"
 // <rdar://problem/22326930> QoI: "argument for generic parameter 'Element' could not be inferred" lacks context
-_ = [] as Set  // expected-error {{generic parameter 'Element' could not be inferred in cast to 'Set<_>}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{14-14=<<#Element: Hashable#>>}}
+_ = [] as Set  // expected-error {{protocol type 'Any' cannot conform to 'Hashable' because only concrete types can conform to protocols}}
 
 
 //<rdar://problem/22509125> QoI: Error when unable to infer generic archetype lacks greatness
@@ -248,12 +248,12 @@ struct S27515965 : P27515965 {
 
 struct V27515965 {
   init<T : P27515965>(_ tp: T) where T.R == Float {}
-  // expected-note@-1 {{candidate requires that the types 'Any' and 'Float' be equivalent (requirement specified as 'T.R' == 'Float' [with T = S27515965])}}
+  // expected-note@-1 {{where 'T.R' = 'Any'}}
 }
 
 func test(x: S27515965) -> V27515965 {
   return V27515965(x)
-  // expected-error@-1 {{cannot invoke initializer for type 'init(_:)' with an argument list of type '(S27515965)'}}
+  // expected-error@-1 {{initializer 'init(_:)' requires the types 'Any' and 'Float' be equivalent}}
 }
 
 protocol BaseProto {}
@@ -265,7 +265,9 @@ protocol SubProto: BaseProto {}
 struct FullyGeneric<Foo> {} // expected-note 11 {{'Foo' declared as parameter to type 'FullyGeneric'}} expected-note 1 {{generic type 'FullyGeneric' declared here}}
 
 struct AnyClassBound<Foo: AnyObject> {} // expected-note {{'Foo' declared as parameter to type 'AnyClassBound'}} expected-note {{generic type 'AnyClassBound' declared here}}
+// expected-note@-1{{requirement specified as 'Foo' : 'AnyObject'}}
 struct AnyClassBound2<Foo> where Foo: AnyObject {} // expected-note {{'Foo' declared as parameter to type 'AnyClassBound2'}}
+// expected-note@-1{{requirement specified as 'Foo' : 'AnyObject' [with Foo = Any]}}
 
 struct ProtoBound<Foo: SubProto> {} // expected-note {{'Foo' declared as parameter to type 'ProtoBound'}} expected-note {{generic type 'ProtoBound' declared here}}
 struct ProtoBound2<Foo> where Foo: SubProto {} // expected-note {{'Foo' declared as parameter to type 'ProtoBound2'}}
@@ -283,10 +285,10 @@ struct ProtosBound3<Foo: SubProto> where Foo: NSCopyish {} // expected-note {{'F
 struct AnyClassAndProtoBound<Foo> where Foo: AnyObject, Foo: SubProto {} // expected-note {{'Foo' declared as parameter to type 'AnyClassAndProtoBound'}}
 struct AnyClassAndProtoBound2<Foo> where Foo: SubProto, Foo: AnyObject {} // expected-note {{'Foo' declared as parameter to type 'AnyClassAndProtoBound2'}}
 
-struct ClassAndProtoBound<Foo> where Foo: X, Foo: SubProto {} // expected-note {{'Foo' declared as parameter to type 'ClassAndProtoBound'}}
+struct ClassAndProtoBound<Foo> where Foo: X, Foo: SubProto {} // expected-note {{where 'Foo' = 'X'}}
 
-struct ClassAndProtosBound<Foo> where Foo: X, Foo: SubProto, Foo: NSCopyish {} // expected-note {{'Foo' declared as parameter to type 'ClassAndProtosBound'}}
-struct ClassAndProtosBound2<Foo> where Foo: X, Foo: SubProto & NSCopyish {} // expected-note {{'Foo' declared as parameter to type 'ClassAndProtosBound2'}}
+struct ClassAndProtosBound<Foo> where Foo: X, Foo: SubProto, Foo: NSCopyish {} // expected-note 2 {{where 'Foo' = 'X'}}
+struct ClassAndProtosBound2<Foo> where Foo: X, Foo: SubProto & NSCopyish {} // expected-note 2 {{where 'Foo' = 'X'}}
 
 extension Pair {
   init(first: T) {}
@@ -301,11 +303,11 @@ func testFixIts() {
   _ = FullyGeneric<Any>()
 
   _ = AnyClassBound() // expected-error {{generic parameter 'Foo' could not be inferred}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{20-20=<AnyObject>}}
-  _ = AnyClassBound<Any>() // expected-error {{'Any' is not convertible to 'AnyObject'}}
+  _ = AnyClassBound<Any>() // expected-error {{'AnyClassBound' requires that 'Any' be a class type}}
   _ = AnyClassBound<AnyObject>()
 
   _ = AnyClassBound2() // expected-error {{generic parameter 'Foo' could not be inferred}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{21-21=<AnyObject>}}
-  _ = AnyClassBound2<Any>() // expected-error {{'Any' is not convertible to 'AnyObject'}}
+  _ = AnyClassBound2<Any>() // expected-error {{'AnyClassBound2' requires that 'Any' be a class type}}
   _ = AnyClassBound2<AnyObject>()
 
   _ = ProtoBound() // expected-error {{generic parameter 'Foo' could not be inferred}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{17-17=<<#Foo: SubProto#>>}}
@@ -329,10 +331,14 @@ func testFixIts() {
   _ = AnyClassAndProtoBound() // expected-error {{generic parameter 'Foo' could not be inferred}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{28-28=<<#Foo: SubProto & AnyObject#>>}}
   _ = AnyClassAndProtoBound2() // expected-error {{generic parameter 'Foo' could not be inferred}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{29-29=<<#Foo: SubProto & AnyObject#>>}}
 
-  _ = ClassAndProtoBound() // expected-error {{generic parameter 'Foo' could not be inferred}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{25-25=<<#Foo: X & SubProto#>>}}
+  _ = ClassAndProtoBound() // expected-error {{referencing initializer 'init()' on 'ClassAndProtoBound' requires that 'X' conform to 'SubProto'}}
 
-  _ = ClassAndProtosBound() // expected-error {{generic parameter 'Foo' could not be inferred}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{26-26=<<#Foo: X & NSCopyish & SubProto#>>}}
-  _ = ClassAndProtosBound2() // expected-error {{generic parameter 'Foo' could not be inferred}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{27-27=<<#Foo: X & NSCopyish & SubProto#>>}}
+  _ = ClassAndProtosBound() 
+  // expected-error@-1 {{referencing initializer 'init()' on 'ClassAndProtosBound' requires that 'X' conform to 'NSCopyish'}}
+  // expected-error@-2 {{referencing initializer 'init()' on 'ClassAndProtosBound' requires that 'X' conform to 'SubProto'}}
+  _ = ClassAndProtosBound2()
+  // expected-error@-1 {{referencing initializer 'init()' on 'ClassAndProtosBound2' requires that 'X' conform to 'NSCopyish'}}
+  // expected-error@-2 {{referencing initializer 'init()' on 'ClassAndProtosBound2' requires that 'X' conform to 'SubProto'}}
 
   _ = Pair() // expected-error {{generic parameter 'T' could not be inferred}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{11-11=<Any, Any>}}
   _ = Pair(first: S()) // expected-error {{generic parameter 'U' could not be inferred}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{11-11=<S, Any>}}
@@ -527,4 +533,91 @@ do {
   func rdar22898292_2<T: B>(_ d: T) {
     _ = { baz($0) }(construct_generic { d }) // Ok
   }
+}
+
+// rdar://problem/35541153 - Generic parameter inference bug
+
+func rdar35541153() {
+  func foo<U: Equatable, V: Equatable, C: Collection>(_ c: C) where C.Element == (U, V) {}
+  func bar<K: Equatable, V, C: Collection>(_ c: C, _ k: K, _ v: V) where C.Element == (K, V) {}
+
+  let x: [(a: Int, b: Int)] = []
+  let y: [(k: String, v: Int)] = []
+
+  foo(x) // Ok
+  bar(y, "ultimate question", 42) // Ok
+}
+
+// rdar://problem/38159133 - [SR-7125]: Swift 4.1 Xcode 9.3b4 regression
+
+protocol P_38159133 {}
+
+do {
+  class Super {}
+  class A: Super, P_38159133 {}
+  class B: Super, P_38159133 {}
+
+  func rdar38159133(_ a: A?, _ b: B?) {
+    let _: [P_38159133] = [a, b].compactMap { $0 } // Ok
+  }
+}
+
+func rdar35890334(_ arr: inout [Int]) {
+  _ = arr.popFirst() // expected-error {{value of type '[Int]' has no member 'popFirst'}}
+}
+
+// rdar://problem/39616039
+
+func rdar39616039() {
+  func foo<V>(default: V, _ values: [String: V]) -> V {
+    return values["foo"] ?? `default`
+  }
+
+  var a = foo(default: 42, ["foo": 0])
+  a += 1 // ok
+
+  var b = foo(default: 42.0, ["foo": 0])
+  b += 1 // ok
+
+  var c = foo(default: 42.0, ["foo": Float(0)])
+  c += 1 // ok
+}
+
+// https://bugs.swift.org/browse/SR-8075
+
+func sr8075() {
+  struct UIFont {
+    init(ofSize: Float) {}
+  }
+
+  func switchOnCategory<T>(_ categoryToValue: [Int: T]) -> T {
+    fatalError()
+  }
+
+  let _: UIFont = .init(ofSize: switchOnCategory([0: 15.5, 1: 20.5]))
+}
+
+// rdar://problem/40537858 - Ambiguous diagnostic when type is missing conformance
+func rdar40537858() {
+  struct S {
+    struct Id {}
+    var id: Id
+  }
+
+  struct List<T: Collection, E: Hashable> { // expected-note {{where 'E' = 'S.Id'}}
+    typealias Data = T.Element
+    init(_: T, id: KeyPath<Data, E>) {}
+  }
+
+  var arr: [S] = []
+  _ = List(arr, id: \.id) // expected-error {{referencing initializer 'init(_:id:)' on 'List' requires that 'S.Id' conform to 'Hashable'}}
+
+  enum E<T: P> { // expected-note 2 {{where 'T' = 'S'}}
+    case foo(T)
+    case bar([T])
+  }
+
+  var s = S(id: S.Id())
+  let _: E = .foo(s)   // expected-error {{generic enum 'E' requires that 'S' conform to 'P'}}
+  let _: E = .bar([s]) // expected-error {{generic enum 'E' requires that 'S' conform to 'P'}}
 }

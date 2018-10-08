@@ -22,18 +22,20 @@
 #include "swift/AST/Identifier.h"
 #include "swift/AST/LookupKinds.h"
 #include "swift/AST/RawComment.h"
+#include "swift/AST/ReferencedNameTracker.h"
 #include "swift/AST/Type.h"
 #include "swift/Basic/Compiler.h"
 #include "swift/Basic/OptionSet.h"
-#include "swift/Basic/SourceLoc.h"
 #include "swift/Basic/STLExtras.h"
+#include "swift/Basic/SourceLoc.h"
+#include "swift/Parse/SyntaxParsingCache.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MD5.h"
@@ -61,7 +63,6 @@ namespace swift {
   class LinkLibrary;
   class LookupCache;
   class ModuleLoader;
-  class NameAliasType;
   class NominalTypeDecl;
   class EnumElementDecl;
   class OperatorDecl;
@@ -81,8 +82,6 @@ namespace swift {
   
 namespace syntax {
   class SourceFileSyntax;
-  class SyntaxParsingContext;
-  class SyntaxParsingContextRoot;
 }
 
 /// Discriminator for file-units.
@@ -95,27 +94,26 @@ enum class FileUnitKind {
   SerializedAST,
   /// An imported Clang module.
   ClangModule,
-  /// A derived declaration.
-  Derived,
 };
 
 enum class SourceFileKind {
   Library,  ///< A normal .swift file.
   Main,     ///< A .swift file that can have top-level code.
   REPL,     ///< A virtual file that holds the user's input in the REPL.
-  SIL       ///< Came from a .sil file.
+  SIL,      ///< Came from a .sil file.
+  Interface ///< Came from a .swiftinterface file, representing another module.
 };
 
 /// Discriminator for resilience strategy.
 enum class ResilienceStrategy : unsigned {
   /// Public nominal types: fragile
-  /// Non-inlineable function bodies: resilient
+  /// Non-inlinable function bodies: resilient
   ///
   /// This is the default behavior without any flags.
   Default,
 
   /// Public nominal types: resilient
-  /// Non-inlineable function bodies: resilient
+  /// Non-inlinable function bodies: resilient
   ///
   /// This is the behavior with -enable-resilience.
   Resilient
@@ -127,7 +125,7 @@ enum class ResilienceStrategy : unsigned {
 /// output binary and logical module (such as a single library or executable).
 ///
 /// \sa FileUnit
-class ModuleDecl : public TypeDecl, public DeclContext {
+class ModuleDecl : public DeclContext, public TypeDecl {
 public:
   typedef ArrayRef<std::pair<Identifier, SourceLoc>> AccessPathTy;
   typedef std::pair<ModuleDecl::AccessPathTy, ModuleDecl*> ImportedModule;
@@ -153,8 +151,47 @@ public:
     }
   };
 
+  /// Produces the components of a given module's full name in reverse order.
+  ///
+  /// For a Swift module, this will only ever have one component, but an
+  /// imported Clang module might actually be a submodule.
+  class ReverseFullNameIterator {
+  public:
+    // Make this look like a valid STL iterator.
+    using difference_type = int;
+    using value_type = StringRef;
+    using pointer = StringRef *;
+    using reference = StringRef;
+    using iterator_category = std::forward_iterator_tag;
+
+  private:
+    PointerUnion<const ModuleDecl *, const /* clang::Module */ void *> current;
+  public:
+    ReverseFullNameIterator() = default;
+    explicit ReverseFullNameIterator(const ModuleDecl *M);
+    explicit ReverseFullNameIterator(const clang::Module *clangModule) {
+      current = clangModule;
+    }
+
+    StringRef operator*() const;
+    ReverseFullNameIterator &operator++();
+
+    friend bool operator==(ReverseFullNameIterator left,
+                           ReverseFullNameIterator right) {
+      return left.current == right.current;
+    }
+    friend bool operator!=(ReverseFullNameIterator left,
+                           ReverseFullNameIterator right) {
+      return !(left == right);
+    }
+
+    /// This is a convenience function that writes the entire name, in forward
+    /// order, to \p out.
+    void printForward(raw_ostream &out) const;
+  };
+
 private:
-  /// If non-NULL, an plug-in that should be used when performing external
+  /// If non-NULL, a plug-in that should be used when performing external
   /// lookups.
   // FIXME: Do we really need to bloat all modules with this?
   DebuggerClient *DebugClient = nullptr;
@@ -207,7 +244,8 @@ private:
   struct {
     unsigned TestingEnabled : 1;
     unsigned FailedToLoad : 1;
-    unsigned ResilienceStrategy : 2;
+    unsigned ResilienceStrategy : 1;
+    unsigned HasResolvedImports : 1;
   } Flags;
 
   ModuleDecl(Identifier name, ASTContext &ctx);
@@ -226,6 +264,7 @@ public:
     return { Files.begin(), Files.size() };
   }
 
+  bool isClangModule() const;
   void addFile(FileUnit &newFile);
   void removeFile(FileUnit &existingFile);
 
@@ -257,6 +296,13 @@ public:
   }
   void setFailedToLoad(bool failed = true) {
     Flags.FailedToLoad = failed;
+  }
+
+  bool hasResolvedImports() const {
+    return Flags.HasResolvedImports;
+  }
+  void setHasResolvedImports() {
+    Flags.HasResolvedImports = true;
   }
 
   ResilienceStrategy getResilienceStrategy() const {
@@ -367,6 +413,12 @@ public:
   void
   getImportedModulesForLookup(SmallVectorImpl<ImportedModule> &imports) const;
 
+  /// Uniques the items in \p imports, ignoring the source locations of the
+  /// access paths.
+  ///
+  /// The order of items in \p imports is \e not preserved.
+  static void removeDuplicateImports(SmallVectorImpl<ImportedModule> &imports);
+
   /// Finds all top-level decls of this module.
   ///
   /// This does a simple local lookup, not recursively looking through imports.
@@ -402,23 +454,17 @@ public:
   ///
   /// \param topLevelAccessPath If present, include the top-level module in the
   ///        results, with the given access path.
-  /// \param includePrivateTopLevelImports If true, imports listed in all
-  ///        file units within this module are traversed. Otherwise (the
-  ///        default), only re-exported imports are traversed.
   /// \param fn A callback of type bool(ImportedModule) or void(ImportedModule).
   ///        Return \c false to abort iteration.
   ///
   /// \return True if the traversal ran to completion, false if it ended early
   ///         due to the callback.
   bool forAllVisibleModules(AccessPathTy topLevelAccessPath,
-                            bool includePrivateTopLevelImports,
                             llvm::function_ref<bool(ImportedModule)> fn);
 
   bool forAllVisibleModules(AccessPathTy topLevelAccessPath,
-                            bool includePrivateTopLevelImports,
                             llvm::function_ref<void(ImportedModule)> fn) {
     return forAllVisibleModules(topLevelAccessPath,
-                                includePrivateTopLevelImports,
                                 [=](const ImportedModule &import) -> bool {
       fn(import);
       return true;
@@ -427,19 +473,10 @@ public:
 
   template <typename Fn>
   bool forAllVisibleModules(AccessPathTy topLevelAccessPath,
-                            bool includePrivateTopLevelImports,
                             Fn &&fn) {
     using RetTy = typename std::result_of<Fn(ImportedModule)>::type;
     llvm::function_ref<RetTy(ImportedModule)> wrapped{std::forward<Fn>(fn)};
-    return forAllVisibleModules(topLevelAccessPath,
-                                includePrivateTopLevelImports,
-                                wrapped);
-  }
-
-  template <typename Fn>
-  bool forAllVisibleModules(AccessPathTy topLevelAccessPath, Fn &&fn) {
-    return forAllVisibleModules(topLevelAccessPath, false,
-                                std::forward<Fn>(fn));
+    return forAllVisibleModules(topLevelAccessPath, wrapped);
   }
 
   /// @}
@@ -469,6 +506,9 @@ public:
   /// \returns true if this module is the "builtin" module.
   bool isBuiltinModule() const;
 
+  /// \returns true if this module is the "SwiftOnoneSupport" module;
+  bool isOnoneSupportModule() const;
+
   /// \returns true if this module is a system module; note that the StdLib is
   /// considered a system module.
   bool isSystemModule() const;
@@ -490,10 +530,21 @@ public:
   /// Returns the associated clang module if one exists.
   const clang::Module *findUnderlyingClangModule() const;
 
+  /// Returns a generator with the components of this module's full,
+  /// hierarchical name.
+  ///
+  /// For a Swift module, this will only ever have one component, but an
+  /// imported Clang module might actually be a submodule.
+  ReverseFullNameIterator getReverseFullModuleName() const {
+    return ReverseFullNameIterator(this);
+  }
+
   SourceRange getSourceRange() const { return SourceRange(); }
 
   static bool classof(const DeclContext *DC) {
-    return DC->getContextKind() == DeclContextKind::Module;
+    if (auto D = DC->getAsDecl())
+      return classof(D);
+    return false;
   }
 
   static bool classof(const Decl *D) {
@@ -813,7 +864,7 @@ private:
   TypeRefinementContext *TRC = nullptr;
 
   /// If non-null, used to track name lookups that happen within this file.
-  ReferencedNameTracker *ReferencedNames = nullptr;
+  Optional<ReferencedNameTracker> ReferencedNames;
 
   /// The class in this file marked \@NS/UIApplicationMain.
   ClassDecl *MainClass = nullptr;
@@ -823,7 +874,8 @@ private:
 
   /// A hash of all interface-contributing tokens that have been lexed for
   /// this source file so far.
-  llvm::MD5 InterfaceHash;
+  /// We only collect interface hash for primary input files.
+  llvm::Optional<llvm::MD5> InterfaceHash;
 
   /// \brief The ID for the memory buffer containing this file's source.
   ///
@@ -839,11 +891,13 @@ private:
 
   friend ASTContext;
   friend Impl;
-
-  ~SourceFile();
 public:
   /// The list of top-level declarations in the source file.
   std::vector<Decl*> Decls;
+
+  /// A cache of syntax nodes that can be reused when creating the syntax tree
+  /// for this file.
+  SyntaxParsingCache *SyntaxParsingCache = nullptr;
 
   /// The list of local type declarations in the source file.
   llvm::SetVector<TypeDecl *> LocalTypeDecls;
@@ -853,6 +907,14 @@ public:
   /// module is still not imported by the time type checking is
   /// complete, we diagnose.
   llvm::SetVector<const DeclAttribute *> AttrsRequiringFoundation;
+
+  /// A set of synthesized declarations that need to be type checked.
+  llvm::SmallVector<Decl *, 8> SynthesizedDecls;
+
+  /// We might perform type checking on the same source file more than once,
+  /// if its the main file or a REPL instance, so keep track of the last
+  /// checked synthesized declaration to avoid duplicating work.
+  unsigned LastCheckedSynthesizedDecl = 0;
 
   /// A mapping from Objective-C selectors to the methods that have
   /// those selectors.
@@ -890,7 +952,8 @@ public:
   ASTStage_t ASTStage = Parsing;
 
   SourceFile(ModuleDecl &M, SourceFileKind K, Optional<unsigned> bufferID,
-             ImplicitModuleImportKind ModImpKind, bool KeepSyntaxInfo);
+             ImplicitModuleImportKind ModImpKind, bool KeepParsedTokens = false,
+             bool KeepSyntaxTree = false);
 
   void
   addImports(ArrayRef<std::pair<ModuleDecl::ImportedModule, ImportOptions>> IM);
@@ -967,13 +1030,14 @@ public:
                                              SourceLoc diagLoc = {});
   /// @}
 
-  ReferencedNameTracker *getReferencedNameTracker() const {
-    return ReferencedNames;
+  ReferencedNameTracker *getReferencedNameTracker() {
+    return ReferencedNames ? ReferencedNames.getPointer() : nullptr;
   }
-  void setReferencedNameTracker(ReferencedNameTracker *Tracker) {
-    assert(!ReferencedNames && "This file already has a name tracker.");
-    ReferencedNames = Tracker;
+  const ReferencedNameTracker *getReferencedNameTracker() const {
+    return ReferencedNames ? ReferencedNames.getPointer() : nullptr;
   }
+
+  void createReferencedNameTracker();
 
   /// \brief The buffer ID for the file that was imported, or None if there
   /// is no associated buffer.
@@ -1015,6 +1079,7 @@ public:
       return true;
       
     case SourceFileKind::Library:
+    case SourceFileKind::Interface:
     case SourceFileKind::SIL:
       return false;
     }
@@ -1052,20 +1117,26 @@ public:
   /// Set the root refinement context for the file.
   void setTypeRefinementContext(TypeRefinementContext *TRC);
 
-  void recordInterfaceToken(StringRef token) {
-    assert(!token.empty());
-    InterfaceHash.update(token);
-    // Add null byte to separate tokens.
-    uint8_t a[1] = {0};
-    InterfaceHash.update(a);
+  void enableInterfaceHash() {
+    assert(!hasInterfaceHash());
+    InterfaceHash.emplace();
   }
 
-  const llvm::MD5 &getInterfaceHashState() { return InterfaceHash; }
-  void setInterfaceHashState(const llvm::MD5 &state) { InterfaceHash = state; }
+  bool hasInterfaceHash() const {
+    return InterfaceHash.hasValue();
+  }
+
+  void recordInterfaceToken(StringRef token) {
+    assert(!token.empty());
+    InterfaceHash->update(token);
+    // Add null byte to separate tokens.
+    uint8_t a[1] = {0};
+    InterfaceHash->update(a);
+  }
 
   void getInterfaceHash(llvm::SmallString<32> &str) {
     llvm::MD5::MD5Result result;
-    InterfaceHash.final(result);
+    InterfaceHash->final(result);
     llvm::MD5::stringifyResult(result, str);
   }
 
@@ -1079,7 +1150,9 @@ public:
 
   ArrayRef<Token> getAllTokens() const;
 
-  bool shouldKeepSyntaxInfo() const;
+  bool shouldCollectToken() const;
+
+  bool shouldBuildSyntaxTree() const;
 
   syntax::SourceFileSyntax getSyntaxRoot() const;
   void setSyntaxRoot(syntax::SourceFileSyntax &&Root);
@@ -1090,7 +1163,7 @@ private:
   /// If not None, the underlying vector should contain tokens of this source file.
   Optional<std::vector<Token>> AllCorrectedTokens;
 
-  SourceFileSyntaxInfo &SyntaxInfo;
+  std::unique_ptr<SourceFileSyntaxInfo> SyntaxInfo;
 };
 
 
@@ -1216,9 +1289,27 @@ public:
   bool isSystemModule() const;
   bool isBuiltinModule() const;
   const ModuleDecl *getAsSwiftModule() const;
+  const clang::Module *getAsClangModule() const;
+
+  void *getOpaqueValue() const {
+    assert(!Mod.isNull());
+    return Mod.getOpaqueValue();
+  }
 
   explicit operator bool() const { return !Mod.isNull(); }
 };
+
+inline bool DeclContext::isModuleContext() const {
+  if (auto D = getAsDecl())
+    return ModuleDecl::classof(D);
+  return false;
+}
+
+inline bool DeclContext::isModuleScopeContext() const {
+  if (ParentAndKind.getInt() == ASTHierarchy::FileUnit)
+    return true;
+  return isModuleContext();
+}
 
 } // end namespace swift
 

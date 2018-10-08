@@ -4,6 +4,7 @@ include("../../../../cmake/modules/StandaloneOverlay.cmake")
 add_swift_library(swiftFoundation ${SWIFT_SDK_OVERLAY_LIBRARY_BUILD_TYPES} IS_SDK_OVERLAY
   AffineTransform.swift
   Boxing.swift
+  BundleLookup.mm
   Calendar.swift
   CharacterSet.swift
   Codable.swift
@@ -26,6 +27,7 @@ add_swift_library(swiftFoundation ${SWIFT_SDK_OVERLAY_LIBRARY_BUILD_TYPES} IS_SD
   NSCoder.swift
   NSDate.swift
   NSDictionary.swift
+  NSError.mm
   NSError.swift
   NSExpression.swift
   NSFastEnumeration.swift

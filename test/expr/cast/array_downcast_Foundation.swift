@@ -1,6 +1,7 @@
 // RUN: %empty-directory(%t)
 
 // FIXME: BEGIN -enable-source-import hackaround
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -emit-module -o %t %clang-importer-sdk-path/swift-modules/Darwin.swift
 // RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -emit-module -o %t %clang-importer-sdk-path/swift-modules/Foundation.swift
 // FIXME: END -enable-source-import hackaround
 
@@ -39,7 +40,7 @@ func testDowncastOptionalObject(obj: AnyObject?!) -> [String]? {
   // CHECK: (forced_checked_cast_expr type='[String]'{{.*value_cast}}
   // CHECK: (bind_optional_expr implicit type='AnyObject'
   // CHECK-NEXT: (force_value_expr implicit type='AnyObject?'
-  // CHECK-NEXT: (declref_expr type='AnyObject?!' 
+  // CHECK-NEXT: (declref_expr type='AnyObject??' 
   return obj as! [String]?
 }
 
@@ -53,7 +54,7 @@ func testDowncastOptionalObjectConditional(obj: AnyObject?!) -> [String]?? {
   // CHECK-NEXT: (conditional_checked_cast_expr type='[String]?' {{.*value_cast}} writtenType='[String]?'
   // CHECK-NEXT: (bind_optional_expr implicit type='AnyObject'
   // CHECK-NEXT: (bind_optional_expr implicit type='AnyObject?'
-  // CHECK-NEXT: (declref_expr type='AnyObject?!'
+  // CHECK-NEXT: (declref_expr type='AnyObject??'
   return obj as? [String]?
 }
 

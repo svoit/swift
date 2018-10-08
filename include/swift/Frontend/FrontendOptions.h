@@ -13,7 +13,10 @@
 #ifndef SWIFT_FRONTEND_FRONTENDOPTIONS_H
 #define SWIFT_FRONTEND_FRONTENDOPTIONS_H
 
-#include "swift/AST/Module.h"
+#include "swift/Basic/FileTypes.h"
+#include "swift/Basic/Version.h"
+#include "swift/Frontend/FrontendInputsAndOutputs.h"
+#include "swift/Frontend/InputFile.h"
 #include "llvm/ADT/Hashing.h"
 
 #include <string>
@@ -21,270 +24,25 @@
 
 namespace llvm {
   class MemoryBuffer;
-  namespace opt {
-  class ArgList;
-  class Arg;
-  } // namespace opt
 }
 
 namespace swift {
 
-class SelectedInput {
-public:
-  /// The index of the input, in either FrontendOptions::InputFilenames or
-  /// FrontendOptions::InputBuffers, depending on this SelectedInput's
-  /// InputKind.
-  unsigned Index;
-
-  enum class InputKind {
-    /// Denotes a file input, in FrontendOptions::InputFilenames
-    Filename,
-
-    /// Denotes a buffer input, in FrontendOptions::InputBuffers
-    Buffer,
-  };
-
-  /// The kind of input which this SelectedInput represents.
-  InputKind Kind;
-
-  SelectedInput(unsigned Index, InputKind Kind = InputKind::Filename)
-      : Index(Index), Kind(Kind) {}
-
-  /// \returns true if the SelectedInput's Kind is a filename
-  bool isFilename() const { return Kind == InputKind::Filename; }
-
-  /// \returns true if the SelectedInput's Kind is a buffer
-  bool isBuffer() const { return Kind == InputKind::Buffer; }
-};
-
-enum class InputFileKind {
-  IFK_None,
-  IFK_Swift,
-  IFK_Swift_Library,
-  IFK_Swift_REPL,
-  IFK_SIL,
-  IFK_LLVM_IR
-};
-
-/// Information about all the inputs to the frontend.
-class FrontendInputs {
-  friend class ArgsToFrontendInputsConverter;
-
-private:
-  /// The names of input files to the frontend.
-  std::vector<std::string> InputFilenames;
-
-  /// Input buffers which may override the file contents of input files.
-  std::vector<llvm::MemoryBuffer *> InputBuffers;
-
-  /// The inputs for which output should be generated. If empty, output will
-  /// be generated for the whole module, in other words, whole-module mode.
-  /// Even if every input file is mentioned here, it is not the same as
-  /// whole-module mode.
-  std::vector<SelectedInput> PrimaryInputs;
-
-public:
-  // Readers:
-
-  // Input filename readers
-  ArrayRef<std::string> getInputFilenames() const { return InputFilenames; }
-  bool haveInputFilenames() const { return !getInputFilenames().empty(); }
-  unsigned inputFilenameCount() const { return getInputFilenames().size(); }
-
-  bool haveUniqueInputFilename() const { return inputFilenameCount() == 1; }
-  const std::string &getFilenameOfFirstInput() const {
-    assert(haveInputFilenames());
-    return getInputFilenames()[0];
-  }
-
-  bool isReadingFromStdin() const {
-    return haveUniqueInputFilename() && getFilenameOfFirstInput() == "-";
-  }
-
-  // If we have exactly one input filename, and its extension is "bc" or "ll",
-  // treat the input as LLVM_IR.
-  bool shouldTreatAsLLVM() const;
-
-  // Input buffer readers
-
-  ArrayRef<llvm::MemoryBuffer *> getInputBuffers() const {
-    return InputBuffers;
-  }
-  unsigned inputBufferCount() const { return getInputBuffers().size(); }
-
-  // Primary input readers
-
-private:
-  void assertMustNotBeMoreThanOnePrimaryInput() const {
-    assert(PrimaryInputs.size() < 2 &&
-           "have not implemented >1 primary input yet");
-  }
-
-public:
-  ArrayRef<SelectedInput> getPrimaryInputs() const { return PrimaryInputs; }
-
-  unsigned primaryInputCount() const { return getPrimaryInputs().size(); }
-
-  // Primary count readers:
-
-  bool haveUniquePrimaryInput() const { return primaryInputCount() == 1; }
-
-  bool havePrimaryInputs() const { return primaryInputCount() > 0; }
-
-  bool isWholeModule() const { return !havePrimaryInputs(); }
-
-  // Count-dependend readers:
-
-  Optional<SelectedInput> getOptionalPrimaryInput() const {
-    return havePrimaryInputs() ? Optional<SelectedInput>(getPrimaryInputs()[0])
-                               : Optional<SelectedInput>();
-  }
-
-  SelectedInput getRequiredUniquePrimaryInput() const {
-    assert(haveUniquePrimaryInput());
-    return getPrimaryInputs()[0];
-  }
-
-  Optional<SelectedInput> getOptionalUniquePrimaryInput() const {
-    return haveUniquePrimaryInput()
-               ? Optional<SelectedInput>(getPrimaryInputs()[0])
-               : Optional<SelectedInput>();
-  }
-
-  bool haveAPrimaryInputFile() const {
-    return havePrimaryInputs() && getOptionalPrimaryInput()->isFilename();
-  }
-
-  Optional<StringRef> getOptionalUniquePrimaryInputFilename() const {
-    Optional<SelectedInput> primaryInput = getOptionalUniquePrimaryInput();
-    return (primaryInput && primaryInput->isFilename())
-               ? Optional<StringRef>(getInputFilenames()[primaryInput->Index])
-               : Optional<StringRef>();
-  }
-
-  bool isPrimaryInputAFileAt(unsigned i) const {
-    assertMustNotBeMoreThanOnePrimaryInput();
-    if (Optional<SelectedInput> primaryInput = getOptionalPrimaryInput())
-      return primaryInput->isFilename() && primaryInput->Index == i;
-    return false;
-  }
-
-  Optional<unsigned> primaryInputFileIndex() const {
-    return haveAPrimaryInputFile()
-               ? Optional<unsigned>(getOptionalPrimaryInput()->Index)
-               : None;
-  }
-
-  StringRef primaryInputFilenameIfAny() const {
-    if (auto Index = primaryInputFileIndex()) {
-      return getInputFilenames()[*Index];
-    }
-    return StringRef();
-  }
-
-public:
-  // Multi-facet readers
-  StringRef baseNameOfOutput(const llvm::opt::ArgList &Args,
-                             StringRef ModuleName) const;
-
-  bool shouldTreatAsSIL() const;
-
-  /// Return true for error
-  bool verifyInputs(DiagnosticEngine &Diags, bool TreatAsSIL,
-                    bool isREPLRequested, bool isNoneRequested) const;
-
-  // Input filename writers
-
-  void addInputFilename(StringRef Filename) {
-    InputFilenames.push_back(Filename);
-  }
-  void transformInputFilenames(
-      const llvm::function_ref<std::string(std::string)> &fn);
-
-  // Input buffer writers
-
-  void addInputBuffer(llvm::MemoryBuffer *Buf) { InputBuffers.push_back(Buf); }
-
-  // Primary input writers
-
-private:
-  std::vector<SelectedInput> &getMutablePrimaryInputs() {
-    assertMustNotBeMoreThanOnePrimaryInput();
-    return PrimaryInputs;
-  }
-
-public:
-  void clearPrimaryInputs() { getMutablePrimaryInputs().clear(); }
-
-  void setPrimaryInputToFirstFile() {
-    clearPrimaryInputs();
-    addPrimaryInput(SelectedInput(0, SelectedInput::InputKind::Filename));
-  }
-
-  void addPrimaryInput(SelectedInput si) { PrimaryInputs.push_back(si); }
-
-  void setPrimaryInput(SelectedInput si) {
-    clearPrimaryInputs();
-    getMutablePrimaryInputs().push_back(si);
-  }
-
-  void addPrimaryInputFilename(unsigned index) {
-    addPrimaryInput(SelectedInput(index, SelectedInput::InputKind::Filename));
-  }
-
-  void setPrimaryInputForInputFilename(const std::string &inputFilename) {
-    setPrimaryInput(!inputFilename.empty() && inputFilename != "-"
-                        ? SelectedInput(inputFilenameCount(),
-                                        SelectedInput::InputKind::Filename)
-                        : SelectedInput(inputBufferCount(),
-                                        SelectedInput::InputKind::Buffer));
-  }
-
-  // Multi-faceted writers
-
-  void clearInputs() {
-    InputFilenames.clear();
-    InputBuffers.clear();
-  }
-};
 
 /// Options for controlling the behavior of the frontend.
 class FrontendOptions {
+  friend class ArgsToFrontendOptionsConverter;
+
 public:
-  FrontendInputs Inputs;
+  FrontendInputsAndOutputs InputsAndOutputs;
 
   /// The kind of input on which the frontend should operate.
-  InputFileKind InputKind = InputFileKind::IFK_Swift;
+  InputFileKind InputKind = InputFileKind::Swift;
 
-  /// The specified output files. If only a single outputfile is generated,
-  /// the name of the last specified file is taken.
-  std::vector<std::string> OutputFilenames;
+  void forAllOutputPaths(const InputFile &input,
+                         llvm::function_ref<void(StringRef)> fn) const;
 
-  void forAllOutputPaths(std::function<void(const std::string &)> fn) const;
-
-  /// Gets the name of the specified output filename.
-  /// If multiple files are specified, the last one is returned.
-  StringRef getSingleOutputFilename() const {
-    if (OutputFilenames.size() >= 1)
-      return OutputFilenames.back();
-    return StringRef();
-  }
-  /// Sets a single filename as output filename.
-  void setSingleOutputFilename(const std::string &FileName) {
-    OutputFilenames.clear();
-    OutputFilenames.push_back(FileName);
-  }
-  void setOutputFilenameToStdout() { setSingleOutputFilename("-"); }
-  bool isOutputFilenameStdout() const {
-    return getSingleOutputFilename() == "-";
-  }
   bool isOutputFileDirectory() const;
-  bool isOutputFilePlainFile() const;
-  bool haveNamedOutputFile() const {
-    return !OutputFilenames.empty() && !isOutputFilenameStdout();
-  }
-  void setOutputFileList(DiagnosticEngine &Diags,
-                         const llvm::opt::ArgList &Args);
 
   /// A list of arbitrary modules to import and make implicitly visible.
   std::vector<std::string> ImplicitImportModuleNames;
@@ -295,36 +53,8 @@ public:
   /// The name of the module which the frontend is building.
   std::string ModuleName;
 
-  /// The path to which we should emit a serialized module.
-  std::string ModuleOutputPath;
-
-  /// The path to which we should emit a module documentation file.
-  std::string ModuleDocOutputPath;
-
   /// The name of the library to link against when using this module.
   std::string ModuleLinkName;
-
-  /// The path to which we should emit an Objective-C header for the module.
-  std::string ObjCHeaderOutputPath;
-
-  /// Path to a file which should contain serialized diagnostics for this
-  /// frontend invocation.
-  std::string SerializedDiagnosticsPath;
-
-  /// The path to which we should output a Make-style dependencies file.
-  std::string DependenciesFilePath;
-
-  /// The path to which we should output a Swift reference dependencies file.
-  std::string ReferenceDependenciesFilePath;
-
-  /// The path to which we should output fixits as source edits.
-  std::string FixitsOutputPath;
-
-  /// The path to which we should output a loaded module trace file.
-  std::string LoadedModuleTracePath;
-
-  /// The path to which we should output a TBD file.
-  std::string TBDPath;
 
   /// Arguments which should be passed in immediate mode.
   std::vector<std::string> ImmediateArgv;
@@ -361,6 +91,11 @@ public:
   /// the expression type checker run before we consider an expression
   /// too complex.
   unsigned SolverExpressionTimeThreshold = 0;
+  
+  /// If non-zero, overrides the default threshold for how many times
+  /// the Space::minus function is called before we consider switch statement
+  /// exhaustiveness checking to be too complex.
+  unsigned SwitchCheckingInvocationThreshold = 0;
 
   /// The module for which we should verify all of the generic signatures.
   std::string VerifyGenericSignaturesInModule;
@@ -368,6 +103,7 @@ public:
   enum class ActionType {
     NoneAction,        ///< No specific action
     Parse,             ///< Parse only
+    ResolveImports,    ///< Parse and resolve imports only
     Typecheck,         ///< Parse and type-check only
     DumpParse,         ///< Parse only and dump AST
     DumpInterfaceHash, ///< Parse and dump the interface token hash.
@@ -400,9 +136,9 @@ public:
     EmitIR,       ///< Emit LLVM IR
     EmitBC,       ///< Emit LLVM BC
     EmitObject,   ///< Emit object file
-  };
 
-  bool isCreatingSIL() { return RequestedAction >= ActionType::EmitSILGen; }
+    DumpTypeInfo, ///< Dump IRGen type info
+  };
 
   /// Indicates the action the user requested that the frontend perform.
   ActionType RequestedAction = ActionType::NoneAction;
@@ -413,6 +149,9 @@ public:
   /// If set, emitted module files will always contain options for the
   /// debugger to use.
   bool AlwaysSerializeDebuggingOptions = false;
+
+  /// If set, inserts instrumentation useful for testing the debugger.
+  bool DebuggerTestingTransform = false;
 
   /// If set, dumps wall time taken to check each function body to llvm::errs().
   bool DebugTimeFunctionBodies = false;
@@ -431,6 +170,13 @@ public:
 
   /// Trace changes to stats to files in StatsOutputDir.
   bool TraceStats = false;
+
+  /// Profile changes to stats to files in StatsOutputDir.
+  bool ProfileEvents = false;
+
+  /// Profile changes to stats to files in StatsOutputDir, grouped by source
+  /// entity.
+  bool ProfileEntities = false;
 
   /// If true, serialization encodes an extra lookup table for use in module-
   /// merging when emitting partial modules (the per-file modules in a non-WMO
@@ -495,18 +241,20 @@ public:
   /// variables by name when we print it out. This eases diffing of SIL files.
   bool EmitSortedSIL = false;
 
+  /// Indicates whether the dependency tracker should track system
+  /// dependencies as well.
+  bool TrackSystemDeps = false;
+
   /// The different modes for validating TBD against the LLVM IR.
   enum class TBDValidationMode {
+    Default,        ///< Do the default validation for the current platform.
     None,           ///< Do no validation.
     MissingFromTBD, ///< Only check for symbols that are in IR but not TBD.
     All, ///< Check for symbols that are in IR but not TBD and TBD but not IR.
   };
 
   /// Compare the symbols in the IR against the TBD file we would generate.
-  TBDValidationMode ValidateTBDAgainstIR = TBDValidationMode::None;
-
-  /// The install_name to use in the TBD file.
-  std::string TBDInstallName;
+  TBDValidationMode ValidateTBDAgainstIR = TBDValidationMode::Default;
 
   /// An enum with different modes for automatically crashing at defined times.
   enum class DebugCrashMode {
@@ -522,11 +270,11 @@ public:
   /// -dump-scope-maps.
   SmallVector<std::pair<unsigned, unsigned>, 2> DumpScopeMapLocations;
 
-  /// Indicates whether the RequestedAction has output.
-  bool actionHasOutput() const;
+  /// Indicates whether the action will immediately run code.
+  static bool isActionImmediate(ActionType);
 
-  /// Indicates whether the RequestedAction will immediately run code.
-  bool actionIsImmediate() const;
+  /// \return true if action only parses without doing other compilation steps.
+  static bool shouldActionOnlyParse(ActionType);
 
   /// Return a hash code of any components from these options that should
   /// contribute to a Swift Bridging PCH hash.
@@ -534,16 +282,33 @@ public:
     return llvm::hash_value(0);
   }
 
-  StringRef originalPath() const;
-
   StringRef determineFallbackModuleName() const;
 
   bool isCompilingExactlyOneSwiftFile() const {
-    return InputKind == InputFileKind::IFK_Swift &&
-           Inputs.haveUniqueInputFilename();
+    return InputKind == InputFileKind::Swift &&
+           InputsAndOutputs.hasSingleInput();
   }
 
-  void setModuleName(DiagnosticEngine &Diags, const llvm::opt::ArgList &Args);
+  const PrimarySpecificPaths &
+  getPrimarySpecificPathsForAtMostOnePrimary() const;
+  const PrimarySpecificPaths &
+      getPrimarySpecificPathsForPrimary(StringRef) const;
+
+private:
+  static bool canActionEmitDependencies(ActionType);
+  static bool canActionEmitReferenceDependencies(ActionType);
+  static bool canActionEmitObjCHeader(ActionType);
+  static bool canActionEmitLoadedModuleTrace(ActionType);
+  static bool canActionEmitModule(ActionType);
+  static bool canActionEmitModuleDoc(ActionType);
+  static bool canActionEmitInterface(ActionType);
+
+public:
+  static bool doesActionGenerateSIL(ActionType);
+  static bool doesActionProduceOutput(ActionType);
+  static bool doesActionProduceTextualOutput(ActionType);
+  static bool needsProperModuleName(ActionType);
+  static file_types::ID formatForPrincipalOutputFileForAction(ActionType);
 };
 
 }

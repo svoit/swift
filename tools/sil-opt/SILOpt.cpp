@@ -15,10 +15,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Strings.h"
 #include "swift/Subsystems.h"
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/SILOptions.h"
+#include "swift/Basic/FileTypes.h"
 #include "swift/Basic/LLVMInitialize.h"
 #include "swift/Basic/LLVMContext.h"
 #include "swift/Frontend/DiagnosticVerifier.h"
@@ -84,6 +84,18 @@ static llvm::cl::opt<bool>
 EnableSILOpaqueValues("enable-sil-opaque-values",
                       llvm::cl::desc("Compile the module with sil-opaque-values enabled."));
 
+static llvm::cl::opt<bool>
+EnableObjCInterop("enable-objc-interop",
+                  llvm::cl::desc("Enable Objective-C interoperability."));
+
+static llvm::cl::opt<bool>
+DisableObjCInterop("disable-objc-interop",
+                   llvm::cl::desc("Disable Objective-C interoperability."));
+
+static llvm::cl::opt<bool>
+VerifyExclusivity("enable-verify-exclusivity",
+                  llvm::cl::desc("Verify the access markers used to enforce exclusivity."));
+
 namespace {
 enum EnforceExclusivityMode {
   Unchecked, // static only
@@ -116,7 +128,8 @@ SDKPath("sdk", llvm::cl::desc("The path to the SDK for use with the clang "
         llvm::cl::init(""));
 
 static llvm::cl::opt<std::string>
-Target("target", llvm::cl::desc("target triple"));
+Target("target", llvm::cl::desc("target triple"),
+       llvm::cl::init(llvm::sys::getDefaultTargetTriple()));
 
 static llvm::cl::opt<OptGroup> OptimizationGroup(
     llvm::cl::desc("Predefined optimization groups:"),
@@ -195,11 +208,11 @@ AssumeUnqualifiedOwnershipWhenParsing(
     "assume-parsing-unqualified-ownership-sil", llvm::cl::Hidden, llvm::cl::init(false),
     llvm::cl::desc("Assume all parsed functions have unqualified ownership"));
 
-static llvm::cl::opt<bool>
-EnableExperimentalConditionalConformances(
-  "enable-experimental-conditional-conformances", llvm::cl::Hidden,
-  llvm::cl::init(false),
-  llvm::cl::desc("Enable experimental implementation of SE-0143: Conditional Conformances"));
+static llvm::cl::opt<bool> DisableGuaranteedNormalArguments(
+    "disable-guaranteed-normal-arguments", llvm::cl::Hidden,
+    llvm::cl::init(false),
+    llvm::cl::desc("Assume that the input module was compiled with "
+                   "-disable-guaranteed-normal-arguments enabled"));
 
 /// Regular expression corresponding to the value given in one of the
 /// -pass-remarks* command line flags. Passes whose name matches this regexp
@@ -260,7 +273,8 @@ static void runCommandLineSelectedPasses(SILModule *Module,
 void anchorForGetMainExecutable() {}
 
 int main(int argc, char **argv) {
-  INITIALIZE_LLVM(argc, argv);
+  PROGRAM_START(argc, argv);
+  INITIALIZE_LLVM();
 
   llvm::cl::ParseCommandLineOptions(argc, argv, "Swift SIL optimizer\n");
 
@@ -301,11 +315,11 @@ int main(int argc, char **argv) {
   Invocation.getLangOptions().EnableAccessControl = false;
   Invocation.getLangOptions().EnableObjCAttrRequiresFoundation = false;
   Invocation.getLangOptions().EnableObjCInterop =
-    llvm::Triple(Target).isOSDarwin();
+    EnableObjCInterop ? true :
+    DisableObjCInterop ? false : llvm::Triple(Target).isOSDarwin();
 
   Invocation.getLangOptions().EnableSILOpaqueValues = EnableSILOpaqueValues;
-  Invocation.getLangOptions().EnableConditionalConformances |=
-    EnableExperimentalConditionalConformances;
+
   Invocation.getLangOptions().OptimizationRemarkPassedPattern =
       createOptRemarkRegex(PassRemarksPassed);
   Invocation.getLangOptions().OptimizationRemarkMissedPattern =
@@ -323,6 +337,7 @@ int main(int argc, char **argv) {
   SILOpts.AssumeUnqualifiedOwnershipWhenParsing =
     AssumeUnqualifiedOwnershipWhenParsing;
 
+  SILOpts.VerifyExclusivity = VerifyExclusivity;
   if (EnforceExclusivity.getNumOccurrences() != 0) {
     switch (EnforceExclusivity) {
     case EnforceExclusivityMode::Unchecked:
@@ -351,8 +366,9 @@ int main(int argc, char **argv) {
 
   serialization::ExtendedValidationInfo extendedInfo;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
-      Invocation.setUpInputForSILTool(InputFilename, ModuleName, false,
-                                      extendedInfo);
+      Invocation.setUpInputForSILTool(InputFilename, ModuleName,
+                                      /*alwaysSetModuleToMain*/ false,
+                                      /*bePrimary*/ !PerformWMO, extendedInfo);
   if (!FileBufOrErr) {
     fprintf(stderr, "Error! Failed to open file: %s\n", InputFilename.c_str());
     exit(-1);
@@ -361,11 +377,6 @@ int main(int argc, char **argv) {
   CompilerInstance CI;
   PrintingDiagnosticConsumer PrintDiags;
   CI.addDiagnosticConsumer(&PrintDiags);
-
-  if (!PerformWMO) {
-    Invocation.getFrontendOptions().Inputs.setPrimaryInputForInputFilename(
-        InputFilename);
-  }
 
   if (CI.setup(Invocation))
     return 1;
@@ -425,7 +436,10 @@ int main(int argc, char **argv) {
   } else {
     auto *SILMod = CI.getSILModule();
     {
-      auto T = irgen::createIRGenModule(SILMod, getGlobalLLVMContext());
+      auto T = irgen::createIRGenModule(
+          SILMod, Invocation.getOutputFilenameForAtMostOnePrimary(),
+          Invocation.getMainInputFilenameForDebugInfoForAtMostOnePrimary(),
+          getGlobalLLVMContext());
       runCommandLineSelectedPasses(SILMod, T.second);
       irgen::deleteIRGenModule(T);
     }
@@ -437,10 +451,12 @@ int main(int argc, char **argv) {
       OutputFile = OutputFilename;
     } else if (ModuleName.size()) {
       OutputFile = ModuleName;
-      llvm::sys::path::replace_extension(OutputFile, SIB_EXTENSION);
+      llvm::sys::path::replace_extension(
+          OutputFile, file_types::getExtension(file_types::TY_SIB));
     } else {
       OutputFile = CI.getMainModule()->getName().str();
-      llvm::sys::path::replace_extension(OutputFile, SIB_EXTENSION);
+      llvm::sys::path::replace_extension(
+          OutputFile, file_types::getExtension(file_types::TY_SIB));
     }
 
     SerializationOptions serializationOpts;

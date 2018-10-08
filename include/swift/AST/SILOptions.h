@@ -42,20 +42,6 @@ public:
   /// The number of threads for multi-threaded code generation.
   int NumThreads = 0;
   
-  enum LinkingMode {
-    /// Skip SIL linking.
-    LinkNone,
-
-    /// Perform normal SIL linking.
-    LinkNormal,
-
-    /// Link all functions during SIL linking.
-    LinkAll
-  };
-
-  /// Controls how to perform SIL linking.
-  LinkingMode LinkMode = LinkNormal;
-
   /// Controls whether to pull in SIL from partial modules during the
   /// merge modules step. Could perhaps be merged with the link mode
   /// above but the interactions between all the flags are tricky.
@@ -63,6 +49,9 @@ public:
 
   /// Remove all runtime assertions during optimizations.
   bool RemoveRuntimeAsserts = false;
+
+  /// Enable existential specializer optimization.
+  bool ExistentialSpecializer = false;
 
   /// Controls whether the SIL ARC optimizations are run.
   bool EnableARCOptimizations = true;
@@ -113,9 +102,6 @@ public:
   /// Should we use a pass pipeline passed in via a json file? Null by default.
   llvm::StringRef ExternalPassPipelineFilename;
 
-  /// Emit normal function arguments using the +0 guaranteed convention.
-  bool EnableGuaranteedNormalArguments = false;
-
   /// Don't generate code using partial_apply in SIL generation.
   bool DisableSILPartialApply = false;
 
@@ -140,6 +126,9 @@ public:
   /// Emit checks to trap at run time when the law of exclusivity is violated.
   bool EnforceExclusivityDynamic = true;
 
+  /// Emit extra exclusvity markers for memory access and verify coverage.
+  bool VerifyExclusivity = false;
+
   /// Enable the mandatory semantic arc optimizer.
   bool EnableMandatorySemanticARCOpts = false;
 
@@ -161,6 +150,10 @@ public:
   bool shouldOptimize() const {
     return OptMode > OptimizationMode::NoOptimization;
   }
+
+  bool hasMultipleIRGenThreads() const { return NumThreads > 1; }
+  bool shouldPerformIRGenerationInParallel() const { return NumThreads != 0; }
+  bool hasMultipleIGMs() const { return hasMultipleIRGenThreads(); }
 };
 
 } // end namespace swift

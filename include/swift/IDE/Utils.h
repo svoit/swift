@@ -77,8 +77,8 @@ struct SourceCompleteResult {
 };
 
 SourceCompleteResult
-isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf);
-SourceCompleteResult isSourceInputComplete(StringRef Text);
+isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf, SourceFileKind SFKind);
+SourceCompleteResult isSourceInputComplete(StringRef Text, SourceFileKind SFKind);
 
 bool initInvocationByClangArguments(ArrayRef<const char *> ArgList,
                                     CompilerInvocation &Invok,
@@ -87,7 +87,7 @@ bool initInvocationByClangArguments(ArrayRef<const char *> ArgList,
 /// Visits all overridden declarations exhaustively from VD, including protocol
 /// conformances and clang declarations.
 void walkOverriddenDecls(const ValueDecl *VD,
-                         std::function<void(llvm::PointerUnion<
+                         llvm::function_ref<void(llvm::PointerUnion<
                              const ValueDecl*, const clang::NamedDecl*>)> Fn);
 
 void collectModuleNames(StringRef SDKPath, std::vector<std::string> &Modules);
@@ -133,9 +133,6 @@ Optional<std::pair<unsigned, unsigned>> parseLineCol(StringRef LineCol);
 Decl *getDeclFromUSR(ASTContext &context, StringRef USR, std::string &error);
 Decl *getDeclFromMangledSymbolName(ASTContext &context, StringRef mangledName,
                                    std::string &error);
-
-Type getTypeFromMangledTypename(ASTContext &Ctx, StringRef mangledName,
-                                std::string &error);
 
 Type getTypeFromMangledSymbolname(ASTContext &Ctx, StringRef mangledName,
                                   std::string &error);
@@ -233,9 +230,8 @@ private:
   bool visitDeclarationArgumentName(Identifier Name, SourceLoc StartLoc,
                                     ValueDecl *D) override;
   bool visitModuleReference(ModuleEntity Mod, CharSourceRange Range) override;
-  bool rangeContainsLoc(SourceRange Range) const {
-    return getSourceMgr().rangeContainsTokenLoc(Range, LocToResolve);
-  }
+  bool rangeContainsLoc(SourceRange Range) const;
+  bool rangeContainsLoc(CharSourceRange Range) const;
   bool isDone() const { return CursorInfo.isValid(); }
   bool tryResolve(ValueDecl *D, TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef,
                   SourceLoc Loc, bool IsRef, Type Ty = Type());

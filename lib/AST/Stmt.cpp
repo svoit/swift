@@ -19,9 +19,15 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/Pattern.h"
+#include "swift/Basic/Statistic.h"
 #include "llvm/ADT/PointerUnion.h"
 
 using namespace swift;
+
+#define STMT(Id, _) \
+  static_assert(IsTriviallyDestructible<Id##Stmt>::value, \
+                "Stmts are BumpPtrAllocated; the destructor is never called");
+#include "swift/AST/StmtNodes.def"
 
 //===----------------------------------------------------------------------===//
 // Stmt methods.
@@ -130,8 +136,9 @@ SourceLoc Stmt::getEndLoc() const {
 BraceStmt::BraceStmt(SourceLoc lbloc, ArrayRef<ASTNode> elts,
                      SourceLoc rbloc, Optional<bool> implicit)
   : Stmt(StmtKind::Brace, getDefaultImplicitFlag(implicit, lbloc)),
-    NumElements(elts.size()), LBLoc(lbloc), RBLoc(rbloc)
+    LBLoc(lbloc), RBLoc(rbloc)
 {
+  Bits.BraceStmt.NumElements = elts.size();
   std::uninitialized_copy(elts.begin(), elts.end(),
                           getTrailingObjects<ASTNode>());
 }
@@ -156,6 +163,18 @@ SourceLoc ReturnStmt::getEndLoc() const {
   if (Result && Result->getEndLoc().isValid())
     return Result->getEndLoc();
   return ReturnLoc;
+}
+
+YieldStmt *YieldStmt::create(const ASTContext &ctx, SourceLoc yieldLoc,
+                             SourceLoc lpLoc, ArrayRef<Expr*> yields,
+                             SourceLoc rpLoc, Optional<bool> implicit) {
+  void *buffer = ctx.Allocate(totalSizeToAlloc<Expr*>(yields.size()),
+                              alignof(YieldStmt));
+  return ::new(buffer) YieldStmt(yieldLoc, lpLoc, yields, rpLoc, implicit);
+}
+
+SourceLoc YieldStmt::getEndLoc() const {
+  return RPLoc.isInvalid() ? getYields()[0]->getEndLoc() : RPLoc;
 }
 
 SourceLoc ThrowStmt::getEndLoc() const { return SubExpr->getEndLoc(); }
@@ -367,17 +386,18 @@ SourceLoc CaseLabelItem::getEndLoc() const {
 }
 
 CaseStmt::CaseStmt(SourceLoc CaseLoc, ArrayRef<CaseLabelItem> CaseLabelItems,
-                   bool HasBoundDecls, SourceLoc ColonLoc, Stmt *Body,
-                   Optional<bool> Implicit)
+                   bool HasBoundDecls, SourceLoc UnknownAttrLoc,
+                   SourceLoc ColonLoc, Stmt *Body, Optional<bool> Implicit)
     : Stmt(StmtKind::Case, getDefaultImplicitFlag(Implicit, CaseLoc)),
-      CaseLoc(CaseLoc), ColonLoc(ColonLoc),
-      BodyAndHasBoundDecls(Body, HasBoundDecls),
-      NumPatterns(CaseLabelItems.size()) {
-  assert(NumPatterns > 0 && "case block must have at least one pattern");
+      UnknownAttrLoc(UnknownAttrLoc), CaseLoc(CaseLoc), ColonLoc(ColonLoc),
+      BodyAndHasBoundDecls(Body, HasBoundDecls) {
+  Bits.CaseStmt.NumPatterns = CaseLabelItems.size();
+  assert(Bits.CaseStmt.NumPatterns > 0 &&
+         "case block must have at least one pattern");
   MutableArrayRef<CaseLabelItem> Items{ getTrailingObjects<CaseLabelItem>(),
-                                        NumPatterns };
+                                        Bits.CaseStmt.NumPatterns };
 
-  for (unsigned i = 0; i < NumPatterns; ++i) {
+  for (unsigned i = 0; i < Bits.CaseStmt.NumPatterns; ++i) {
     new (&Items[i]) CaseLabelItem(CaseLabelItems[i]);
     Items[i].getPattern()->markOwnedByStatement(this);
   }
@@ -385,12 +405,13 @@ CaseStmt::CaseStmt(SourceLoc CaseLoc, ArrayRef<CaseLabelItem> CaseLabelItems,
 
 CaseStmt *CaseStmt::create(ASTContext &C, SourceLoc CaseLoc,
                            ArrayRef<CaseLabelItem> CaseLabelItems,
-                           bool HasBoundDecls, SourceLoc ColonLoc, Stmt *Body,
+                           bool HasBoundDecls, SourceLoc UnknownAttrLoc,
+                           SourceLoc ColonLoc, Stmt *Body,
                            Optional<bool> Implicit) {
   void *Mem = C.Allocate(totalSizeToAlloc<CaseLabelItem>(CaseLabelItems.size()),
                          alignof(CaseStmt));
-  return ::new (Mem) CaseStmt(CaseLoc, CaseLabelItems, HasBoundDecls, ColonLoc,
-                              Body, Implicit);
+  return ::new (Mem) CaseStmt(CaseLoc, CaseLabelItems, HasBoundDecls,
+                              UnknownAttrLoc, ColonLoc, Body, Implicit);
 }
 
 SwitchStmt *SwitchStmt::create(LabeledStmtInfo LabelInfo, SourceLoc SwitchLoc,
@@ -402,7 +423,8 @@ SwitchStmt *SwitchStmt::create(LabeledStmtInfo LabelInfo, SourceLoc SwitchLoc,
 #ifndef NDEBUG
   for (auto N : Cases)
     assert((N.is<Stmt*>() && isa<CaseStmt>(N.get<Stmt*>())) ||
-           (N.is<Decl*>() && isa<IfConfigDecl>(N.get<Decl*>())));
+           (N.is<Decl*>() && (isa<IfConfigDecl>(N.get<Decl*>()) ||
+                              isa<PoundDiagnosticDecl>(N.get<Decl*>()))));
 #endif
 
   void *p = C.Allocate(totalSizeToAlloc<ASTNode>(Cases.size()),
@@ -414,4 +436,32 @@ SwitchStmt *SwitchStmt::create(LabeledStmtInfo LabelInfo, SourceLoc SwitchLoc,
   std::uninitialized_copy(Cases.begin(), Cases.end(),
                           theSwitch->getTrailingObjects<ASTNode>());
   return theSwitch;
+}
+
+// See swift/Basic/Statistic.h for declaration: this enables tracing Stmts, is
+// defined here to avoid too much layering violation / circular linkage
+// dependency.
+
+struct StmtTraceFormatter : public UnifiedStatsReporter::TraceFormatter {
+  void traceName(const void *Entity, raw_ostream &OS) const {
+    if (!Entity)
+      return;
+    const Stmt *S = static_cast<const Stmt *>(Entity);
+    OS << Stmt::getKindName(S->getKind());
+  }
+  void traceLoc(const void *Entity, SourceManager *SM,
+                clang::SourceManager *CSM, raw_ostream &OS) const {
+    if (!Entity)
+      return;
+    const Stmt *S = static_cast<const Stmt *>(Entity);
+    S->getSourceRange().print(OS, *SM, false);
+  }
+};
+
+static StmtTraceFormatter TF;
+
+template<>
+const UnifiedStatsReporter::TraceFormatter*
+FrontendStatsTracer::getTraceFormatter<const Stmt *>() {
+  return &TF;
 }

@@ -16,10 +16,10 @@
 #include "swift/ABI/MetadataValues.h"
 #include "swift/Demangling/Demangle.h"
 #include "swift/Basic/LLVMInitialize.h"
+#include "swift/Reflection/ReflectionContext.h"
 #include "swift/Reflection/TypeRef.h"
 #include "swift/Reflection/TypeRefBuilder.h"
 #include "llvm/Object/Archive.h"
-#include "llvm/Object/MachO.h"
 #include "llvm/Object/MachOUniversal.h"
 #include "llvm/Object/ELF.h"
 #include "llvm/Object/ELFObjectFile.h"
@@ -79,68 +79,80 @@ static T unwrap(llvm::Expected<T> value) {
   exit(EXIT_FAILURE);
 }
 
-static SectionRef getSectionRef(const ObjectFile *objectFile,
-                                ArrayRef<StringRef> anySectionNames) {
-  for (auto section : objectFile->sections()) {
-    StringRef sectionName;
-    section.getName(sectionName);
-    for (auto desiredName : anySectionNames) {
-      if (sectionName.equals(desiredName)) {
-        return section;
+using NativeReflectionContext
+  = ReflectionContext<External<RuntimeTarget<sizeof(uintptr_t)>>>;
+
+class ObjectMemoryReader : public MemoryReader {
+  const std::vector<const ObjectFile *> &ObjectFiles;
+public:
+  ObjectMemoryReader(const std::vector<const ObjectFile *> &ObjectFiles)
+    : ObjectFiles(ObjectFiles)
+  {
+  }
+
+  bool queryDataLayout(DataLayoutQueryType type, void *inBuffer,
+                       void *outBuffer) override {
+    switch (type) {
+      case DLQ_GetPointerSize: {
+        auto result = static_cast<uint8_t *>(outBuffer);
+        *result = sizeof(void *);
+        return true;
+      }
+      case DLQ_GetSizeSize: {
+        auto result = static_cast<uint8_t *>(outBuffer);
+        *result = sizeof(size_t);
+        return true;
       }
     }
-  }
-  return SectionRef();
-}
 
-template <typename Section>
-static std::pair<Section, uintptr_t>
-findReflectionSection(const ObjectFile *objectFile,
-                      ArrayRef<StringRef> anySectionNames) {
-  auto sectionRef = getSectionRef(objectFile, anySectionNames);
-
-  if (sectionRef.getObject() == nullptr)
-    return {{nullptr, nullptr}, 0};
-
-  StringRef sectionContents;
-  sectionRef.getContents(sectionContents);
-
-  uintptr_t Offset = 0;
-  if (isa<ELFObjectFileBase>(sectionRef.getObject())) {
-    ELFSectionRef S{sectionRef};
-    Offset = sectionRef.getAddress() - S.getOffset();
+    return false;
   }
 
-  return {{reinterpret_cast<const void *>(sectionContents.begin()),
-           reinterpret_cast<const void *>(sectionContents.end())},
-          Offset};
-}
+  RemoteAddress getSymbolAddress(const std::string &name) override {
+    for (auto &object : ObjectFiles) {
+      for (auto &symbol : object->symbols()) {
+        if (unwrap(symbol.getName()).equals(name)) {
+          // TODO: Account for offset in ELF binaries
+          return RemoteAddress(unwrap(symbol.getAddress()));
+        }
+      }
+    }
+    return RemoteAddress(nullptr);
+  }
+  
+  bool isAddressValid(RemoteAddress addr, uint64_t size) const {
+    // TODO: Account for offset in ELF binaries
 
-static ReflectionInfo findReflectionInfo(const ObjectFile *objectFile) {
-  auto fieldSection = findReflectionSection<FieldSection>(
-      objectFile, {"__swift3_fieldmd", ".swift3_fieldmd", "swift3_fieldmd"});
-  auto associatedTypeSection = findReflectionSection<AssociatedTypeSection>(
-      objectFile, {"__swift3_assocty", ".swift3_assocty", "swift3_assocty"});
-  auto builtinTypeSection = findReflectionSection<BuiltinTypeSection>(
-      objectFile, {"__swift3_builtin", ".swift3_builtin", "swift3_builtin"});
-  auto captureSection = findReflectionSection<CaptureSection>(
-      objectFile, {"__swift3_capture", ".swift3_capture", "swift3_capture"});
-  auto typeRefSection = findReflectionSection<GenericSection>(
-      objectFile, {"__swift3_typeref", ".swift3_typeref", "swift3_typeref"});
-  auto reflectionStringsSection = findReflectionSection<GenericSection>(
-      objectFile, {"__swift3_reflstr", ".swift3_reflstr", "swift3_reflstr"});
+    auto src = addr.getAddressData();
+    
+    // Check that the source is in bounds of one of the object files.
+    for (auto &object : ObjectFiles) {
+      if ((uint64_t)object->getData().bytes_begin() <= src
+          && src + size <= (uint64_t)object->getData().bytes_end()) {
+        return true;
+      }
+    }
+    return false;
+  }
+  
+  ReadBytesResult readBytes(RemoteAddress address, uint64_t size) override {
+    if (!isAddressValid(address, size))
+      return ReadBytesResult(nullptr, [](const void *){});
 
-  return {
-      {fieldSection.first, fieldSection.second},
-      {associatedTypeSection.first, associatedTypeSection.second},
-      {builtinTypeSection.first, builtinTypeSection.second},
-      {captureSection.first, captureSection.second},
-      {typeRefSection.first, typeRefSection.second},
-      {reflectionStringsSection.first, reflectionStringsSection.second},
-      /*LocalStartAddress*/ 0,
-      /*RemoteStartAddress*/ 0,
-  };
-}
+    // TODO: Account for offset in ELF binaries
+    return ReadBytesResult((const void *)address.getAddressData(), [](const void *) {});
+  }
+  
+  bool readString(RemoteAddress address, std::string &dest) override {
+    if (!isAddressValid(address, 1))
+      return false;
+    // TODO: Account for running off the edge of an object, offset in ELF
+    // binaries
+    auto cString = StringRef((const char*)address.getAddressData());
+    dest.append(cString.begin(), cString.end());
+    return true;
+  }
+};
 
 static int doDumpReflectionSections(ArrayRef<std::string> binaryFilenames,
                                     StringRef arch,
@@ -150,9 +162,13 @@ static int doDumpReflectionSections(ArrayRef<std::string> binaryFilenames,
   // once they go out of scope, we can no longer do anything.
   std::vector<OwningBinary<Binary>> binaryOwners;
   std::vector<std::unique_ptr<ObjectFile>> objectOwners;
+  std::vector<const ObjectFile *> objectFiles;
 
-  // Construct the TypeRefBuilder
-  TypeRefBuilder builder;
+  // Construct the ReflectionContext.
+  // FIXME: Should pick a Runtime template based on the bitwidth of the target
+  // architecture.
+  auto reader = std::make_shared<ObjectMemoryReader>(objectFiles);
+  NativeReflectionContext context(std::move(reader));
 
   for (auto binaryFilename : binaryFilenames) {
     auto binaryOwner = unwrap(createBinary(binaryFilename));
@@ -171,17 +187,19 @@ static int doDumpReflectionSections(ArrayRef<std::string> binaryFilenames,
       objectFile = objectOwner.get();
     }
 
-    builder.addReflectionInfo(findReflectionInfo(objectFile));
-
     // Retain the objects that own section memory
     binaryOwners.push_back(std::move(binaryOwner));
     objectOwners.push_back(std::move(objectOwner));
+    objectFiles.push_back(objectFile);
+
+    auto startAddress = (uintptr_t)objectFile->getData().begin();
+    context.addImage(RemoteAddress(startAddress));
   }
 
   switch (action) {
   case ActionType::DumpReflectionSections:
     // Dump everything
-    builder.dumpAllSections(OS);
+    context.getBuilder().dumpAllSections(OS);
     break;
   case ActionType::DumpTypeLowering: {
     for (std::string line; std::getline(std::cin, line); ) {
@@ -193,14 +211,16 @@ static int doDumpReflectionSections(ArrayRef<std::string> binaryFilenames,
 
       Demangle::Demangler Dem;
       auto demangled = Dem.demangleType(line);
-      auto *typeRef = swift::remote::decodeMangledType(builder, demangled);
+      auto *typeRef = swift::Demangle::decodeMangledType(context.getBuilder(),
+                                                         demangled);
       if (typeRef == nullptr) {
         OS << "Invalid typeref: " << line << "\n";
         continue;
       }
 
       typeRef->dump(OS);
-      auto *typeInfo = builder.getTypeConverter().getTypeInfo(typeRef);
+      auto *typeInfo =
+        context.getBuilder().getTypeConverter().getTypeInfo(typeRef);
       if (typeInfo == nullptr) {
         OS << "Invalid lowering\n";
         continue;
@@ -215,6 +235,7 @@ static int doDumpReflectionSections(ArrayRef<std::string> binaryFilenames,
 }
 
 int main(int argc, char *argv[]) {
+  PROGRAM_START(argc, argv);
   llvm::cl::ParseCommandLineOptions(argc, argv, "Swift Reflection Dump\n");
   return doDumpReflectionSections(options::BinaryFilename,
                                   options::Architecture,

@@ -58,34 +58,11 @@ SILGlobalVariable *SILGenModule::getSILGlobalVariable(VarDecl *gDecl,
   return silGlobal;
 }
 
-/// True if the global stored property requires lazy initialization.
-static bool isGlobalLazilyInitialized(VarDecl *var) {
-  assert(!var->getDeclContext()->isLocalContext() &&
-         "not a global variable!");
-  assert(var->hasStorage() &&
-         "not a stored global variable!");
-
-  // Imports from C are never lazily initialized.
-  if (var->hasClangNode())
-    return false;
-
-  if (var->isDebuggerVar())
-    return false;
-
-  // Top-level global variables in the main source file and in the REPL are not
-  // lazily initialized.
-  auto sourceFileContext = dyn_cast<SourceFile>(var->getDeclContext());
-  if (!sourceFileContext)
-    return true;
-
-  return !sourceFileContext->isScriptMode();
-}
-
 ManagedValue
 SILGenFunction::emitGlobalVariableRef(SILLocation loc, VarDecl *var) {
   assert(!VarLocs.count(var));
 
-  if (isGlobalLazilyInitialized(var)) {
+  if (var->isLazilyInitializedGlobal()) {
     // Call the global accessor to get the variable's address.
     SILFunction *accessorFn = SGM.getFunction(
                             SILDeclRef(var, SILDeclRef::Kind::GlobalAccessor),
@@ -294,20 +271,5 @@ void SILGenFunction::emitGlobalAccessor(VarDecl *global,
   auto *ret = B.createReturn(global, addr);
   (void)ret;
   assert(ret->getDebugScope() && "instruction without scope");
-}
-
-void SILGenFunction::emitGlobalGetter(VarDecl *global,
-                                      SILGlobalVariable *onceToken,
-                                      SILFunction *onceFunc) {
-  emitOnceCall(*this, global, onceToken, onceFunc);
-
-  auto *silG = SGM.getSILGlobalVariable(global, NotForDefinition);
-  SILValue addr = B.createGlobalAddr(global, silG);
-
-  auto refType = global->getInterfaceType()->getCanonicalType();
-  ManagedValue value = emitLoad(global, addr, getTypeLowering(refType),
-                                SGFContext(), IsNotTake);
-  SILValue result = value.forward(*this);
-  B.createReturn(global, result);
 }
 

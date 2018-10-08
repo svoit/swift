@@ -1,6 +1,7 @@
 // RUN: mkdir -p %t
 // RUN: %target-clang -fobjc-arc %S/Inputs/NSSlowString/NSSlowString.m -c -o %t/NSSlowString.o
 // RUN: %target-build-swift -I %S/Inputs/NSSlowString/ %t/NSSlowString.o %s -o %t/a.out
+// RUN: %target-codesign %t/a.out
 // RUN: %target-run %t/a.out
 
 // REQUIRES: executable_test
@@ -40,6 +41,20 @@ func check(
 	checkSingleForm(s.dropFirst(), expectedCount: count-1, expectedCodeUnitCount: nil)
 	checkSingleForm(s.dropLast(), expectedCount: count-1, expectedCodeUnitCount: nil)
 	checkSingleForm(s.dropLast().dropFirst(), expectedCount: count-2, expectedCodeUnitCount: nil)
+}
+
+tests.test("Iterator") {
+  let native = "abc👍👩‍👩‍👧‍👦de\u{0301}f"
+  let opaque = NSSlowString(string: "abc👍👩‍👩‍👧‍👦de\u{0301}f") as String
+  expectEqualSequence(opaque, native)
+  expectEqualSequence(opaque.unicodeScalars, native.unicodeScalars)
+  expectEqualSequence(opaque.utf16, native.utf16)
+  expectEqualSequence(opaque.utf8, native.utf8)
+
+  expectEqualSequence(opaque.reversed(), native.reversed())
+  expectEqualSequence(opaque.unicodeScalars.reversed(), native.unicodeScalars.reversed())
+  expectEqualSequence(opaque.utf16.reversed(), native.utf16.reversed())
+  expectEqualSequence(opaque.utf8.reversed(), native.utf8.reversed())
 }
 
 tests.test("Unicode 9 grapheme breaking") {

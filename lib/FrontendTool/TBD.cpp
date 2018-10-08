@@ -38,9 +38,8 @@ static std::vector<StringRef> sortSymbols(llvm::StringSet<> &symbols) {
   return sorted;
 }
 
-bool swift::writeTBD(ModuleDecl *M, bool hasMultipleIRGenThreads,
-                     StringRef OutputFilename,
-                     StringRef installName) {
+bool swift::writeTBD(ModuleDecl *M, StringRef OutputFilename,
+                     const TBDGenOptions &Opts) {
   std::error_code EC;
   llvm::raw_fd_ostream OS(OutputFilename, EC, llvm::sys::fs::F_None);
   if (EC) {
@@ -49,7 +48,7 @@ bool swift::writeTBD(ModuleDecl *M, bool hasMultipleIRGenThreads,
     return true;
   }
 
-  writeTBDFile(M, OS, hasMultipleIRGenThreads, installName);
+  writeTBDFile(M, OS, Opts);
 
   return false;
 }
@@ -58,15 +57,19 @@ bool swift::inputFileKindCanHaveTBDValidated(InputFileKind kind) {
   // Only things that involve an AST can have a TBD file computed, at the
   // moment.
   switch (kind) {
-  case InputFileKind::IFK_Swift:
-  case InputFileKind::IFK_Swift_Library:
+  case InputFileKind::Swift:
+  case InputFileKind::SwiftLibrary:
     return true;
-  case InputFileKind::IFK_None:
-  case InputFileKind::IFK_Swift_REPL:
-  case InputFileKind::IFK_SIL:
-  case InputFileKind::IFK_LLVM_IR:
+  case InputFileKind::SwiftModuleInterface:
+    // FIXME: This would be a good test of the interface format.
+    return false;
+  case InputFileKind::None:
+  case InputFileKind::SwiftREPL:
+  case InputFileKind::SIL:
+  case InputFileKind::LLVM:
     return false;
   }
+  llvm_unreachable("unhandled kind");
 }
 
 static bool validateSymbolSet(DiagnosticEngine &diags,
@@ -114,25 +117,30 @@ static bool validateSymbolSet(DiagnosticEngine &diags,
     }
   }
 
+  if (error) {
+    diags.diagnose(SourceLoc(), diag::tbd_validation_failure);
+  }
+
   return error;
 }
 
 bool swift::validateTBD(ModuleDecl *M, llvm::Module &IRModule,
-                        bool hasMultipleIRGenThreads,
+                        const TBDGenOptions &opts,
                         bool diagnoseExtraSymbolsInTBD) {
   llvm::StringSet<> symbols;
-  enumeratePublicSymbols(M, symbols, hasMultipleIRGenThreads);
+  enumeratePublicSymbols(M, symbols, opts);
 
   return validateSymbolSet(M->getASTContext().Diags, symbols, IRModule,
                            diagnoseExtraSymbolsInTBD);
 }
 
 bool swift::validateTBD(FileUnit *file, llvm::Module &IRModule,
-                        bool hasMultipleIRGenThreads,
+                        const TBDGenOptions &opts,
                         bool diagnoseExtraSymbolsInTBD) {
   llvm::StringSet<> symbols;
-  enumeratePublicSymbols(file, symbols, hasMultipleIRGenThreads);
+  enumeratePublicSymbols(file, symbols, opts);
 
   return validateSymbolSet(file->getParentModule()->getASTContext().Diags,
-                           symbols, IRModule, diagnoseExtraSymbolsInTBD);
+                           symbols, IRModule,
+                           diagnoseExtraSymbolsInTBD);
 }

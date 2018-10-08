@@ -7,7 +7,7 @@ add_swift_library(swiftSILGen STATIC
   ResultPlan.cpp
   RValue.cpp
   Scope.cpp
-  SwitchCaseFullExpr.cpp
+  SwitchEnumBuilder.cpp
   SILGen.cpp
   SILGenApply.cpp
   SILGenBridging.cpp
@@ -24,10 +24,8 @@ add_swift_library(swiftSILGen STATIC
   SILGenFunction.cpp
   SILGenGlobalVariable.cpp
   SILGenLValue.cpp
-  SILGenMaterializeForSet.cpp
   SILGenPattern.cpp
   SILGenPoly.cpp
-  SILGenProfiling.cpp
   SILGenProlog.cpp
   SILGenStmt.cpp
   SILGenThunk.cpp

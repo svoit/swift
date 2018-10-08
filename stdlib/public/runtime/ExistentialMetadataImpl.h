@@ -19,6 +19,7 @@
 #define SWIFT_RUNTIME_EXISTENTIALMETADATAIMPL_H
 
 #include "MetadataImpl.h"
+#include "swift/Runtime/ExistentialContainer.h"
 
 namespace swift {
 namespace metadataimpl {
@@ -106,20 +107,9 @@ struct LLVM_LIBRARY_VISIBILITY OpaqueExistentialBoxBase
   static Container *initializeWithTake(Container *dest, Container *src,
                                        A... args) {
     src->copyTypeInto(dest, args...);
-    auto *type = src->getType();
-    auto *vwt = type->getValueWitnesses();
-
-    if (vwt->isValueInline()) {
-      auto *destValue =
-          reinterpret_cast<OpaqueValue *>(dest->getBuffer(args...));
-      auto *srcValue =
-          reinterpret_cast<OpaqueValue *>(src->getBuffer(args...));
-
-      type->vw_initializeWithTake(destValue, srcValue);
-    } else {
-      // initWithTake of the reference to the cow box.
-      copyReference(dest, src, Dest::Init, Source::Take, args...);
-    }
+    auto from = src->getBuffer(args...);
+    auto to = dest->getBuffer(args...);
+    memcpy(to, from, sizeof(ValueBuffer));
     return dest;
   }
 
@@ -337,8 +327,19 @@ struct LLVM_LIBRARY_VISIBILITY OpaqueExistentialBox
   static constexpr size_t alignment = alignof(Container);
   static constexpr size_t stride = sizeof(Container);
   static constexpr size_t isPOD = false;
-  static constexpr bool isBitwiseTakable = false;
-  static constexpr unsigned numExtraInhabitants = 0;
+  static constexpr bool isBitwiseTakable = true;
+  static constexpr unsigned numExtraInhabitants =
+    swift_getHeapObjectExtraInhabitantCount();
+  
+  static void storeExtraInhabitant(Container *dest, int index) {
+    swift_storeHeapObjectExtraInhabitant((HeapObject**)&dest->Header.Type,
+                                         index);
+  }
+
+  static int getExtraInhabitantIndex(const Container *src) {
+    return swift_getHeapObjectExtraInhabitantIndex(
+                                        (HeapObject* const *)&src->Header.Type);
+  }
 };
 
 /// A non-fixed box implementation class for an opaque existential
@@ -381,7 +382,18 @@ struct LLVM_LIBRARY_VISIBILITY NonFixedOpaqueExistentialBox
   };
 
   using type = Container;
-  static constexpr unsigned numExtraInhabitants = 0;
+  static constexpr unsigned numExtraInhabitants =
+    swift_getHeapObjectExtraInhabitantCount();
+  
+  static void storeExtraInhabitant(Container *dest, int index) {
+    swift_storeHeapObjectExtraInhabitant(
+                            (HeapObject**)(uintptr_t)&dest->Header.Type, index);
+  }
+
+  static int getExtraInhabitantIndex(const Container *src) {
+    return swift_getHeapObjectExtraInhabitantIndex(
+                             (HeapObject* const *)(uintptr_t)&src->Header.Type);
+  }
 };
 
 /// A common base class for fixed and non-fixed class-existential box
@@ -393,7 +405,7 @@ struct LLVM_LIBRARY_VISIBILITY ClassExistentialBoxBase
 
   template <class Container, class... A>
   static void destroy(Container *value, A... args) {
-    swift_unknownRelease(*value->getValueSlot());
+    swift_unknownObjectRelease(*value->getValueSlot());
   }
   
   template <class Container, class... A>
@@ -402,7 +414,7 @@ struct LLVM_LIBRARY_VISIBILITY ClassExistentialBoxBase
     src->copyTypeInto(dest, args...);
     auto newValue = *src->getValueSlot();
     *dest->getValueSlot() = newValue;
-    swift_unknownRetain(newValue);
+    swift_unknownObjectRetain(newValue);
     return dest;  
   }
 
@@ -421,8 +433,8 @@ struct LLVM_LIBRARY_VISIBILITY ClassExistentialBoxBase
     auto newValue = *src->getValueSlot();
     auto oldValue = *dest->getValueSlot();
     *dest->getValueSlot() = newValue;
-    swift_unknownRetain(newValue);
-    swift_unknownRelease(oldValue);
+    swift_unknownObjectRetain(newValue);
+    swift_unknownObjectRelease(oldValue);
     return dest;
   }
 
@@ -433,7 +445,7 @@ struct LLVM_LIBRARY_VISIBILITY ClassExistentialBoxBase
     auto newValue = *src->getValueSlot();
     auto oldValue = *dest->getValueSlot();
     *dest->getValueSlot() = newValue;
-    swift_unknownRelease(oldValue);
+    swift_unknownObjectRelease(oldValue);
     return dest;
   }
 

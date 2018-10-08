@@ -27,6 +27,23 @@ using namespace sil;
     }                                                                          \
     return ValueOwnershipKind::OWNERSHIP;                                      \
   }
+
+
+
+#define NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+  CONSTANT_OWNERSHIP_INST(Owned, Load##Name)
+#define ALWAYS_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+  CONSTANT_OWNERSHIP_INST(Unowned, RefTo##Name) \
+  CONSTANT_OWNERSHIP_INST(Unowned, Name##ToRef) \
+  CONSTANT_OWNERSHIP_INST(Owned, Copy##Name##Value)
+#define SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+  NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, "...") \
+  ALWAYS_LOADABLE_CHECKED_REF_STORAGE(Name, "...")
+#define UNCHECKED_REF_STORAGE(Name, ...) \
+  CONSTANT_OWNERSHIP_INST(Trivial, RefTo##Name) \
+  CONSTANT_OWNERSHIP_INST(Unowned, Name##ToRef)
+#include "swift/AST/ReferenceStorage.def"
+
 CONSTANT_OWNERSHIP_INST(Guaranteed, BeginBorrow)
 CONSTANT_OWNERSHIP_INST(Guaranteed, LoadBorrow)
 CONSTANT_OWNERSHIP_INST(Owned, AllocBox)
@@ -35,14 +52,10 @@ CONSTANT_OWNERSHIP_INST(Owned, AllocRef)
 CONSTANT_OWNERSHIP_INST(Owned, AllocRefDynamic)
 CONSTANT_OWNERSHIP_INST(Trivial, AllocValueBuffer)
 CONSTANT_OWNERSHIP_INST(Owned, CopyBlock)
+CONSTANT_OWNERSHIP_INST(Owned, CopyBlockWithoutEscaping)
 CONSTANT_OWNERSHIP_INST(Owned, CopyValue)
-CONSTANT_OWNERSHIP_INST(Owned, CopyUnownedValue)
-CONSTANT_OWNERSHIP_INST(Owned, LoadUnowned)
-CONSTANT_OWNERSHIP_INST(Owned, LoadWeak)
 CONSTANT_OWNERSHIP_INST(Owned, KeyPath)
 CONSTANT_OWNERSHIP_INST(Owned, PartialApply)
-CONSTANT_OWNERSHIP_INST(Owned, StrongPin)
-CONSTANT_OWNERSHIP_INST(Owned, ThinToThickFunction)
 CONSTANT_OWNERSHIP_INST(Owned, InitExistentialValue)
 CONSTANT_OWNERSHIP_INST(Owned, GlobalValue) // TODO: is this correct?
 
@@ -62,6 +75,7 @@ CONSTANT_OWNERSHIP_INST(Trivial, AllocStack)
 CONSTANT_OWNERSHIP_INST(Trivial, BeginAccess)
 CONSTANT_OWNERSHIP_INST(Trivial, BridgeObjectToWord)
 CONSTANT_OWNERSHIP_INST(Trivial, ClassMethod)
+CONSTANT_OWNERSHIP_INST(Trivial, ClassifyBridgeObject)
 CONSTANT_OWNERSHIP_INST(Trivial, ObjCMethod)
 CONSTANT_OWNERSHIP_INST(Trivial, ExistentialMetatype)
 CONSTANT_OWNERSHIP_INST(Trivial, FloatLiteral)
@@ -74,7 +88,7 @@ CONSTANT_OWNERSHIP_INST(Trivial, InitExistentialAddr)
 CONSTANT_OWNERSHIP_INST(Trivial, InitExistentialMetatype)
 CONSTANT_OWNERSHIP_INST(Trivial, IntegerLiteral)
 CONSTANT_OWNERSHIP_INST(Trivial, IsUnique)
-CONSTANT_OWNERSHIP_INST(Trivial, IsUniqueOrPinned)
+CONSTANT_OWNERSHIP_INST(Trivial, IsEscapingClosure)
 CONSTANT_OWNERSHIP_INST(Trivial, MarkUninitializedBehavior)
 CONSTANT_OWNERSHIP_INST(Trivial, Metatype)
 CONSTANT_OWNERSHIP_INST(Trivial, ObjCToThickMetatype)
@@ -90,10 +104,8 @@ CONSTANT_OWNERSHIP_INST(Trivial, ProjectValueBuffer)
 CONSTANT_OWNERSHIP_INST(Trivial, RefElementAddr)
 CONSTANT_OWNERSHIP_INST(Trivial, RefTailAddr)
 CONSTANT_OWNERSHIP_INST(Trivial, RefToRawPointer)
-CONSTANT_OWNERSHIP_INST(Trivial, RefToUnmanaged)
 CONSTANT_OWNERSHIP_INST(Trivial, SelectEnumAddr)
 CONSTANT_OWNERSHIP_INST(Trivial, StringLiteral)
-CONSTANT_OWNERSHIP_INST(Trivial, ConstStringLiteral)
 CONSTANT_OWNERSHIP_INST(Trivial, StructElementAddr)
 CONSTANT_OWNERSHIP_INST(Trivial, SuperMethod)
 CONSTANT_OWNERSHIP_INST(Trivial, ObjCSuperMethod)
@@ -107,13 +119,12 @@ CONSTANT_OWNERSHIP_INST(Trivial, UncheckedTrivialBitCast)
 CONSTANT_OWNERSHIP_INST(Trivial, ValueMetatype)
 CONSTANT_OWNERSHIP_INST(Trivial, WitnessMethod)
 CONSTANT_OWNERSHIP_INST(Trivial, StoreBorrow)
+CONSTANT_OWNERSHIP_INST(Trivial, ConvertEscapeToNoEscape)
 CONSTANT_OWNERSHIP_INST(Unowned, InitBlockStorageHeader)
 // TODO: It would be great to get rid of these.
 CONSTANT_OWNERSHIP_INST(Unowned, RawPointerToRef)
-CONSTANT_OWNERSHIP_INST(Unowned, RefToUnowned)
-CONSTANT_OWNERSHIP_INST(Unowned, UnmanagedToRef)
-CONSTANT_OWNERSHIP_INST(Unowned, UnownedToRef)
 CONSTANT_OWNERSHIP_INST(Unowned, ObjCProtocol)
+CONSTANT_OWNERSHIP_INST(Unowned, ValueToBridgeObject)
 #undef CONSTANT_OWNERSHIP_INST
 
 #define CONSTANT_OR_TRIVIAL_OWNERSHIP_INST(OWNERSHIP, INST)                    \
@@ -145,7 +156,25 @@ CONSTANT_OR_TRIVIAL_OWNERSHIP_INST(Owned, UnconditionalCheckedCastValue)
 // If both the operand and the result are nontrivial, then either the types must
 // be compatible so that TBAA doesn't allow the destroy to be hoisted above uses
 // of the cast, or the programmer must use Builtin.fixLifetime.
+//
+// FIXME
+// -----
+//
+// SR-7175: Since we model this as unowned, then we must copy the
+// value before use. This directly contradicts the semantics mentioned
+// above since we will copy the value upon any use lest we use an
+// unowned value in an owned or guaranteed way. So really all we will
+// do here is perhaps add a copy slightly earlier unless the unowned
+// value immediately is cast to something trivial. In such a case, we
+// should be able to simplify the cast to just a trivial value and
+// then eliminate the copy. That being said, we should investigate
+// this since this is used in reinterpret_cast which is important from
+// a performance perspective.
 CONSTANT_OR_TRIVIAL_OWNERSHIP_INST(Unowned, UncheckedBitwiseCast)
+
+// A thin_to_thick instruction can return a trivial (@noescape) type.
+CONSTANT_OR_TRIVIAL_OWNERSHIP_INST(Owned, ThinToThickFunction)
+
 #undef CONSTANT_OR_TRIVIAL_OWNERSHIP_INST
 
 // For a forwarding instruction, we loop over all operands and make sure that
@@ -248,7 +277,7 @@ ValueOwnershipKind ValueOwnershipKindClassifier::visitSILUndef(SILUndef *Arg) {
 }
 
 ValueOwnershipKind
-ValueOwnershipKindClassifier::visitSILPHIArgument(SILPHIArgument *Arg) {
+ValueOwnershipKindClassifier::visitSILPhiArgument(SILPhiArgument *Arg) {
   return Arg->getOwnershipKind();
 }
 
@@ -365,8 +394,9 @@ struct ValueOwnershipKindBuiltinVisitor
     }                                                                          \
     return ValueOwnershipKind::OWNERSHIP;                                      \
   }
-CONSTANT_OWNERSHIP_BUILTIN(Owned, Take)
-CONSTANT_OWNERSHIP_BUILTIN(Owned, TryPin)
+// This returns a value at +1 that is destroyed strictly /after/ the
+// UnsafeGuaranteedEnd. This provides the guarantee that we want.
+CONSTANT_OWNERSHIP_BUILTIN(Owned, UnsafeGuaranteed)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, AShr)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, Add)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, And)
@@ -408,9 +438,6 @@ CONSTANT_OWNERSHIP_BUILTIN(Trivial, ICMP_ULE)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, ICMP_ULT)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, IntToPtr)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, LShr)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, Load)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, LoadRaw)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, LoadInvariant)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, Mul)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, Or)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, PtrToInt)
@@ -437,31 +464,13 @@ CONSTANT_OWNERSHIP_BUILTIN(Trivial, ZExt)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, ZExtOrBitCast)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, FCMP_ORD)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, FCMP_UNO)
-CONSTANT_OWNERSHIP_BUILTIN(Unowned, CastToNativeObject)
-CONSTANT_OWNERSHIP_BUILTIN(Unowned, UnsafeCastToNativeObject)
-CONSTANT_OWNERSHIP_BUILTIN(Unowned, CastFromNativeObject)
-CONSTANT_OWNERSHIP_BUILTIN(Unowned, CastToBridgeObject)
-CONSTANT_OWNERSHIP_BUILTIN(Unowned, CastReferenceFromBridgeObject)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, CastBitPatternFromBridgeObject)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, BridgeToRawPointer)
-CONSTANT_OWNERSHIP_BUILTIN(Unowned, BridgeFromRawPointer)
-CONSTANT_OWNERSHIP_BUILTIN(Unowned, CastReference)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, AddressOf)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, GepRaw)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, Gep)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, GetTailAddr)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, OnFastPath)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, IsUnique)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, IsUniqueOrPinned)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, IsUnique_native)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, IsUniqueOrPinned_native)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, BindMemory)
-CONSTANT_OWNERSHIP_BUILTIN(Owned, AllocWithTailElems)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, ProjectTailElems)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, IsOptionalType)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, Sizeof)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, Strideof)
+CONSTANT_OWNERSHIP_BUILTIN(Trivial, StringObjectOr)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, IsPOD)
+CONSTANT_OWNERSHIP_BUILTIN(Trivial, IsBitwiseTakable)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, IsSameMetatype)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, Alignof)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, AllocRaw)
@@ -502,15 +511,6 @@ CONSTANT_OWNERSHIP_BUILTIN(Trivial, UnexpectedError)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, ErrorInMain)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, DeallocRaw)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, Fence)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, Retain)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, Release)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, CondFail)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, FixLifetime)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, Autorelease)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, Unpin)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, Destroy)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, Assign)
-CONSTANT_OWNERSHIP_BUILTIN(Trivial, Init)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, AtomicStore)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, Once)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, OnceWithContext)
@@ -528,7 +528,6 @@ CONSTANT_OWNERSHIP_BUILTIN(Trivial, Swift3ImplicitObjCEntrypoint)
     }                                                                          \
     return ValueOwnershipKind::Unowned;                                        \
   }
-UNOWNED_OR_TRIVIAL_DEPENDING_ON_RESULT(ReinterpretCast)
 UNOWNED_OR_TRIVIAL_DEPENDING_ON_RESULT(CmpXChg)
 UNOWNED_OR_TRIVIAL_DEPENDING_ON_RESULT(AtomicLoad)
 UNOWNED_OR_TRIVIAL_DEPENDING_ON_RESULT(ExtractElement)
@@ -536,17 +535,14 @@ UNOWNED_OR_TRIVIAL_DEPENDING_ON_RESULT(InsertElement)
 UNOWNED_OR_TRIVIAL_DEPENDING_ON_RESULT(ZeroInitializer)
 #undef UNOWNED_OR_TRIVIAL_DEPENDING_ON_RESULT
 
-ValueOwnershipKind
-ValueOwnershipKindBuiltinVisitor::visitUnsafeGuaranteed(BuiltinInst *BI,
-                                                        StringRef Attr) {
-  assert(!BI->getType().isTrivial(BI->getModule()) &&
-         "Only non trivial types can have non trivial ownership");
-  auto Kind = BI->getArguments()[0].getOwnershipKind();
-  assert((Kind == ValueOwnershipKind::Owned ||
-          Kind == ValueOwnershipKind::Guaranteed) &&
-         "Invalid ownership kind for unsafe guaranteed?!");
-  return Kind;
-}
+#define BUILTIN(X,Y,Z)
+#define BUILTIN_SIL_OPERATION(ID, NAME, CATEGORY) \
+  ValueOwnershipKind ValueOwnershipKindBuiltinVisitor::visit##ID( \
+      BuiltinInst *BI, StringRef Attr) { \
+    llvm_unreachable("builtin should have been lowered in SILGen"); \
+  }
+
+#include "swift/AST/Builtins.def"
 
 ValueOwnershipKind
 ValueOwnershipKindClassifier::visitBuiltinInst(BuiltinInst *BI) {
